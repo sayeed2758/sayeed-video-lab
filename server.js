@@ -101,10 +101,6 @@ async function getChannel() {
 // ==================================================
 
 async function findLatestVideoMessage() {
-  if (cachedVideoMessage) {
-    return cachedVideoMessage;
-  }
-
   const tg = await getClient();
   const channel = await getChannel();
 
@@ -144,9 +140,7 @@ async function findLatestVideoMessage() {
       message.media &&
       message.media.document &&
       message.media.document.mimeType &&
-      message.media.document.mimeType.startsWith(
-        "video/"
-      )
+      message.media.document.mimeType.startsWith("video/")
     );
   });
 
@@ -163,8 +157,6 @@ async function findLatestVideoMessage() {
 
   const latestVideo = videos[0];
 
-  cachedVideoMessage = latestVideo;
-
   const document =
     latestVideo.media.document;
 
@@ -174,7 +166,6 @@ async function findLatestVideoMessage() {
 
   return latestVideo;
 }
-
 
 // ==================================================
 // HEALTH
