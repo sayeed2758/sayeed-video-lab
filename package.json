@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "express": "^5.1.0",
-    "telegram": "^2.26.22"
+    "telegram": "^2.26.22",
     "big-integer": "^1.6.52"
   }
 }
