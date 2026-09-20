@@ -13,8 +13,7 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 const CHANNEL_ID = "-1004305906553";
 
-// Scan first 200 message IDs for this POC.
-// Telegram channels can return up to 200 message IDs per request.
+// POC library scan range
 const SCAN_FROM = 1;
 const SCAN_TO = 200;
 
@@ -22,7 +21,6 @@ const stringSession = new StringSession("");
 
 let tgClient = null;
 let cachedChannel = null;
-let cachedVideoMessage = null;
 
 
 // ==================================================
@@ -34,17 +32,23 @@ async function getClient() {
     return tgClient;
   }
 
+  if (!API_ID || !API_HASH || !BOT_TOKEN) {
+    throw new Error(
+      "Telegram environment variables are missing."
+    );
+  }
+
   tgClient = new TelegramClient(
     stringSession,
     API_ID,
     API_HASH,
     {
-      connectionRetries: 5,
+      connectionRetries: 5
     }
   );
 
   await tgClient.start({
-    botAuthToken: BOT_TOKEN,
+    botAuthToken: BOT_TOKEN
   });
 
   console.log("Telegram MTProto connected.");
@@ -72,9 +76,9 @@ async function getChannel() {
       id: [
         new Api.InputChannel({
           channelId: mtprotoChannelId,
-          accessHash: 0n,
-        }),
-      ],
+          accessHash: 0n
+        })
+      ]
     })
   );
 
@@ -95,20 +99,29 @@ async function getChannel() {
   return channel;
 }
 
+
+// ==================================================
+// PARSE VIDEO METADATA
+// ==================================================
+
 function parseVideoMetadata(message) {
   const text = message?.message || "";
 
   const course =
-    text.match(/^COURSE:\s*(.+)$/im)?.[1]?.trim() || null;
+    text.match(/^COURSE:\s*(.+)$/im)?.[1]?.trim() ||
+    null;
 
   const module =
-    text.match(/^MODULE:\s*(.+)$/im)?.[1]?.trim() || null;
+    text.match(/^MODULE:\s*(.+)$/im)?.[1]?.trim() ||
+    null;
 
   const video =
-    text.match(/^VIDEO:\s*(.+)$/im)?.[1]?.trim() || null;
+    text.match(/^VIDEO:\s*(.+)$/im)?.[1]?.trim() ||
+    null;
 
   const title =
-    text.match(/^TITLE:\s*(.+)$/im)?.[1]?.trim() || null;
+    text.match(/^TITLE:\s*(.+)$/im)?.[1]?.trim() ||
+    null;
 
   return {
     course,
@@ -118,8 +131,89 @@ function parseVideoMetadata(message) {
   };
 }
 
+
 // ==================================================
-// FIND LATEST VIDEO
+// GET DOCUMENT FILE NAME
+// ==================================================
+
+function getDocumentFileName(document) {
+  const attribute =
+    document.attributes?.find(
+      (item) =>
+        item.className ===
+        "DocumentAttributeFilename"
+    );
+
+  return attribute?.fileName || null;
+}
+
+
+// ==================================================
+// GET VIDEO MESSAGE BY MESSAGE ID
+// ==================================================
+
+async function getVideoMessage(messageId) {
+  const tg = await getClient();
+  const channel = await getChannel();
+
+  const numericMessageId = Number(messageId);
+
+  if (
+    !Number.isInteger(numericMessageId) ||
+    numericMessageId <= 0
+  ) {
+    throw new Error(
+      "Invalid Telegram message ID."
+    );
+  }
+
+  const result = await tg.invoke(
+    new Api.channels.GetMessages({
+      channel: new Api.InputChannel({
+        channelId: channel.id,
+        accessHash: channel.accessHash
+      }),
+
+      id: [
+        new Api.InputMessageID({
+          id: numericMessageId
+        })
+      ]
+    })
+  );
+
+  const message = result.messages?.[0];
+
+  if (!message) {
+    throw new Error(
+      `Telegram message ${numericMessageId} not found.`
+    );
+  }
+
+  if (
+    !message.media ||
+    !message.media.document
+  ) {
+    throw new Error(
+      `Message ${numericMessageId} does not contain a video document.`
+    );
+  }
+
+  const mimeType =
+    message.media.document.mimeType || "";
+
+  if (!mimeType.startsWith("video/")) {
+    throw new Error(
+      `Message ${numericMessageId} is not a video.`
+    );
+  }
+
+  return message;
+}
+
+
+// ==================================================
+// FIND LATEST VIDEO MESSAGE
 // ==================================================
 
 async function findLatestVideoMessage() {
@@ -135,7 +229,7 @@ async function findLatestVideoMessage() {
   ) {
     messageIds.push(
       new Api.InputMessageID({
-        id,
+        id
       })
     );
   }
@@ -148,23 +242,28 @@ async function findLatestVideoMessage() {
     new Api.channels.GetMessages({
       channel: new Api.InputChannel({
         channelId: channel.id,
-        accessHash: channel.accessHash,
+        accessHash: channel.accessHash
       }),
-      id: messageIds,
+
+      id: messageIds
     })
   );
 
-  const messages = result.messages || [];
+  const messages =
+    result.messages || [];
 
-  const videos = messages.filter((message) => {
-    return (
-      message &&
-      message.media &&
-      message.media.document &&
-      message.media.document.mimeType &&
-      message.media.document.mimeType.startsWith("video/")
-    );
-  });
+  const videos =
+    messages.filter((message) => {
+      return (
+        message &&
+        message.media &&
+        message.media.document &&
+        message.media.document.mimeType &&
+        message.media.document.mimeType.startsWith(
+          "video/"
+        )
+      );
+    });
 
   if (videos.length === 0) {
     throw new Error(
@@ -177,7 +276,8 @@ async function findLatestVideoMessage() {
       Number(b.id) - Number(a.id)
   );
 
-  const latestVideo = videos[0];
+  const latestVideo =
+    videos[0];
 
   const document =
     latestVideo.media.document;
@@ -189,14 +289,7 @@ async function findLatestVideoMessage() {
   return latestVideo;
 }
 
-function getDocumentFileName(document) {
-  const attribute = document.attributes?.find(
-    (item) =>
-      item.className === "DocumentAttributeFilename"
-  );
 
-  return attribute?.fileName || null;
-}
 // ==================================================
 // HEALTH
 // ==================================================
@@ -209,7 +302,7 @@ app.get("/health", async (req, res) => {
       success: true,
       server: "Sayeed Video Lab",
       telegram: "connected",
-      bot: true,
+      bot: true
     });
 
   } catch (error) {
@@ -220,7 +313,7 @@ app.get("/health", async (req, res) => {
 
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: error.message
     });
   }
 });
@@ -244,12 +337,14 @@ app.get("/latest", async (req, res) => {
     res.json({
       success: true,
 
-      messageId: Number(message.id),
+      messageId:
+        Number(message.id),
 
       metadata,
 
       file: {
-        fileSize: Number(document.size),
+        fileSize:
+          Number(document.size),
 
         fileSizeMB:
           Number(document.size) /
@@ -259,13 +354,9 @@ app.get("/latest", async (req, res) => {
           document.mimeType || null,
 
         fileName:
-          document.attributes
-            ?.find(
-              (attribute) =>
-                attribute.className ===
-                "DocumentAttributeFilename"
-            )
-            ?.fileName || null
+          getDocumentFileName(
+            document
+          )
       }
     });
 
@@ -281,6 +372,11 @@ app.get("/latest", async (req, res) => {
     });
   }
 });
+
+
+// ==================================================
+// VIDEO LIBRARY
+// ==================================================
 
 app.get("/library", async (req, res) => {
   try {
@@ -311,73 +407,93 @@ app.get("/library", async (req, res) => {
           channelId: channel.id,
           accessHash: channel.accessHash
         }),
+
         id: messageIds
       })
     );
 
-    const messages = result.messages || [];
+    const messages =
+      result.messages || [];
 
-    const videos = messages
-      .filter((message) => {
-        return (
-          message &&
-          message.media &&
-          message.media.document &&
-          message.media.document.mimeType &&
-          message.media.document.mimeType.startsWith(
-            "video/"
-          )
+    const videos =
+      messages
+        .filter((message) => {
+          return (
+            message &&
+            message.media &&
+            message.media.document &&
+            message.media.document.mimeType &&
+            message.media.document.mimeType.startsWith(
+              "video/"
+            )
+          );
+        })
+        .map((message) => {
+          const document =
+            message.media.document;
+
+          const metadata =
+            parseVideoMetadata(
+              message
+            );
+
+          return {
+            messageId:
+              Number(message.id),
+
+            metadata: {
+              course:
+                metadata.course,
+
+              module:
+                metadata.module,
+
+              videoId:
+                metadata.video,
+
+              title:
+                metadata.title
+            },
+
+            file: {
+              size:
+                Number(document.size),
+
+              sizeMB:
+                Number(document.size) /
+                (1024 * 1024),
+
+              mimeType:
+                document.mimeType ||
+                null,
+
+              fileName:
+                getDocumentFileName(
+                  document
+                )
+            }
+          };
+        })
+        .filter((video) => {
+          return (
+            video.metadata.course &&
+            video.metadata.module &&
+            video.metadata.videoId &&
+            video.metadata.title
+          );
+        })
+        .sort(
+          (a, b) =>
+            a.messageId -
+            b.messageId
         );
-      })
-      .map((message) => {
-        const document =
-          message.media.document;
-
-        const metadata =
-          parseVideoMetadata(message);
-
-        return {
-          messageId: Number(message.id),
-
-          metadata: {
-            course: metadata.course,
-            module: metadata.module,
-            videoId: metadata.video,
-            title: metadata.title
-          },
-
-          file: {
-            size: Number(document.size),
-
-            sizeMB:
-              Number(document.size) /
-              (1024 * 1024),
-
-            mimeType:
-              document.mimeType || null,
-
-            fileName:
-              getDocumentFileName(document)
-          }
-        };
-      })
-      .filter((video) => {
-        // Only include videos having our metadata format.
-        return (
-          video.metadata.course &&
-          video.metadata.module &&
-          video.metadata.videoId &&
-          video.metadata.title
-        );
-      })
-      .sort(
-        (a, b) =>
-          a.messageId - b.messageId
-      );
 
     res.json({
       success: true,
-      count: videos.length,
+
+      count:
+        videos.length,
+
       videos
     });
 
@@ -394,16 +510,42 @@ app.get("/library", async (req, res) => {
   }
 });
 
+
 // ==================================================
 // VIDEO STREAM
+//
+// Examples:
+//
+// /video?messageId=19
+// /video?messageId=20
+//
+// Without messageId:
+// /video
+// -> latest video
 // ==================================================
 
 app.get("/video", async (req, res) => {
   try {
-    const tg = await getClient();
+    const tg =
+      await getClient();
 
-    const message =
-      await findLatestVideoMessage();
+    const requestedMessageId =
+      req.query.messageId;
+
+    let message;
+
+    if (
+      requestedMessageId !==
+      undefined
+    ) {
+      message =
+        await getVideoMessage(
+          requestedMessageId
+        );
+    } else {
+      message =
+        await findLatestVideoMessage();
+    }
 
     const document =
       message.media.document;
@@ -411,22 +553,27 @@ app.get("/video", async (req, res) => {
     const fileSize =
       Number(document.size);
 
-    if (!fileSize || fileSize <= 0) {
+    if (
+      !fileSize ||
+      fileSize <= 0
+    ) {
       throw new Error(
         "Invalid Telegram video file size."
       );
     }
 
+    // ----------------------------------------------
+    // RANGE REQUEST
+    // ----------------------------------------------
+
     const range =
       req.headers.range;
 
     let start = 0;
-    let end = fileSize - 1;
-    let statusCode = 200;
+    let end =
+      fileSize - 1;
 
-    // ----------------------------------------------
-    // RANGE
-    // ----------------------------------------------
+    let statusCode = 200;
 
     if (range) {
       const match =
@@ -445,16 +592,18 @@ app.get("/video", async (req, res) => {
             Number(match[2]);
         }
 
+        // Suffix range:
         // bytes=-500000
         if (
           !match[1] &&
           match[2]
         ) {
-          const suffix =
+          const suffixLength =
             Number(match[2]);
 
           start = Math.max(
-            fileSize - suffix,
+            fileSize -
+              suffixLength,
             0
           );
 
@@ -463,8 +612,9 @@ app.get("/video", async (req, res) => {
         }
 
         if (
-          start > end ||
-          start >= fileSize
+          start < 0 ||
+          start >= fileSize ||
+          start > end
         ) {
           res.status(416);
 
@@ -489,7 +639,7 @@ app.get("/video", async (req, res) => {
       end - start + 1;
 
     // ----------------------------------------------
-    // HEADERS
+    // RESPONSE HEADERS
     // ----------------------------------------------
 
     res.status(statusCode);
@@ -510,7 +660,9 @@ app.get("/video", async (req, res) => {
       contentLength
     );
 
-    if (statusCode === 206) {
+    if (
+      statusCode === 206
+    ) {
       res.setHeader(
         "Content-Range",
         `bytes ${start}-${end}/${fileSize}`
@@ -553,16 +705,22 @@ app.get("/video", async (req, res) => {
 
     const iterator =
       tg.iterDownload({
-        file: message.media,
+        file:
+          message.media,
+
         offset,
+
         requestSize:
           CHUNK_SIZE,
+
         chunkSize:
           CHUNK_SIZE,
+
         limit:
           chunkCount,
+
         fileSize:
-          bigInt(fileSize),
+          bigInt(fileSize)
       });
 
     for await (
@@ -576,7 +734,9 @@ app.get("/video", async (req, res) => {
         requestedBytes -
         bytesSent;
 
-      if (remaining <= 0) {
+      if (
+        remaining <= 0
+      ) {
         break;
       }
 
@@ -624,7 +784,8 @@ app.get("/video", async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({
         success: false,
-        error: error.message,
+        error:
+          error.message
       });
     } else {
       res.destroy();
@@ -634,11 +795,14 @@ app.get("/video", async (req, res) => {
 
 
 // ==================================================
-// START
+// START SERVER
 // ==================================================
 
-app.listen(PORT, () => {
-  console.log(
-    `Sayeed Video Lab server running on port ${PORT}`
-  );
-});
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `Sayeed Video Lab server running on port ${PORT}`
+    );
+  }
+);
