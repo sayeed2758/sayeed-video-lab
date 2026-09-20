@@ -10,10 +10,7 @@ const app = express();
 // ==================================================
 
 app.use((req, res, next) => {
-  res.setHeader(
-    "Access-Control-Allow-Origin",
-    "*"
-  );
+  res.setHeader("Access-Control-Allow-Origin", "*");
 
   res.setHeader(
     "Access-Control-Allow-Methods",
@@ -45,7 +42,7 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 const CHANNEL_ID = "-1004305906553";
 
-// POC library scan range
+// POC scan range
 const SCAN_FROM = 1;
 const SCAN_TO = 200;
 
@@ -181,6 +178,23 @@ function getDocumentFileName(document) {
 
 
 // ==================================================
+// CHECK VIDEO MESSAGE
+// ==================================================
+
+function isVideoMessage(message) {
+  return Boolean(
+    message &&
+    message.media &&
+    message.media.document &&
+    message.media.document.mimeType &&
+    message.media.document.mimeType.startsWith(
+      "video/"
+    )
+  );
+}
+
+
+// ==================================================
 // GET VIDEO MESSAGE BY MESSAGE ID
 // ==================================================
 
@@ -222,19 +236,7 @@ async function getVideoMessage(messageId) {
     );
   }
 
-  if (
-    !message.media ||
-    !message.media.document
-  ) {
-    throw new Error(
-      `Message ${numericMessageId} does not contain a video document.`
-    );
-  }
-
-  const mimeType =
-    message.media.document.mimeType || "";
-
-  if (!mimeType.startsWith("video/")) {
+  if (!isVideoMessage(message)) {
     throw new Error(
       `Message ${numericMessageId} is not a video.`
     );
@@ -245,10 +247,10 @@ async function getVideoMessage(messageId) {
 
 
 // ==================================================
-// FIND LATEST VIDEO MESSAGE
+// SCAN TELEGRAM VIDEO MESSAGES
 // ==================================================
 
-async function findLatestVideoMessage() {
+async function scanVideoMessages() {
   const tg = await getClient();
   const channel = await getChannel();
 
@@ -281,21 +283,54 @@ async function findLatestVideoMessage() {
     })
   );
 
-  const messages =
-    result.messages || [];
+  const messages = result.messages || [];
 
-  const videos =
-    messages.filter((message) => {
-      return (
-        message &&
-        message.media &&
-        message.media.document &&
-        message.media.document.mimeType &&
-        message.media.document.mimeType.startsWith(
-          "video/"
-        )
-      );
+  const videos = messages
+    .filter(isVideoMessage)
+    .map((message) => {
+      const document =
+        message.media.document;
+
+      const metadata =
+        parseVideoMetadata(message);
+
+      return {
+        messageId: Number(message.id),
+
+        metadata: {
+          course: metadata.course,
+          module: metadata.module,
+          videoId: metadata.video,
+          title: metadata.title
+        },
+
+        file: {
+          size: Number(document.size),
+
+          sizeMB:
+            Number(document.size) /
+            (1024 * 1024),
+
+          mimeType:
+            document.mimeType || null,
+
+          fileName:
+            getDocumentFileName(document)
+        }
+      };
     });
+
+  return videos;
+}
+
+
+// ==================================================
+// FIND LATEST VIDEO
+// ==================================================
+
+async function findLatestVideoMessage() {
+  const videos =
+    await scanVideoMessages();
 
   if (videos.length === 0) {
     throw new Error(
@@ -305,20 +340,13 @@ async function findLatestVideoMessage() {
 
   videos.sort(
     (a, b) =>
-      Number(b.id) - Number(a.id)
+      b.messageId -
+      a.messageId
   );
 
-  const latestVideo =
-    videos[0];
-
-  const document =
-    latestVideo.media.document;
-
-  console.log(
-    `Latest video found: message=${latestVideo.id}, size=${document.size}`
+  return getVideoMessage(
+    videos[0].messageId
   );
-
-  return latestVideo;
 }
 
 
@@ -407,105 +435,16 @@ app.get("/latest", async (req, res) => {
 
 
 // ==================================================
-// VIDEO LIBRARY
+// FLAT VIDEO LIBRARY
 // ==================================================
 
 app.get("/library", async (req, res) => {
   try {
-    const tg = await getClient();
-    const channel = await getChannel();
-
-    const messageIds = [];
-
-    for (
-      let id = SCAN_FROM;
-      id <= SCAN_TO;
-      id++
-    ) {
-      messageIds.push(
-        new Api.InputMessageID({
-          id
-        })
-      );
-    }
-
-    console.log(
-      `Scanning messages ${SCAN_FROM}-${SCAN_TO} for video library...`
-    );
-
-    const result = await tg.invoke(
-      new Api.channels.GetMessages({
-        channel: new Api.InputChannel({
-          channelId: channel.id,
-          accessHash: channel.accessHash
-        }),
-
-        id: messageIds
-      })
-    );
-
-    const messages =
-      result.messages || [];
-
     const videos =
-      messages
-        .filter((message) => {
-          return (
-            message &&
-            message.media &&
-            message.media.document &&
-            message.media.document.mimeType &&
-            message.media.document.mimeType.startsWith(
-              "video/"
-            )
-          );
-        })
-        .map((message) => {
-          const document =
-            message.media.document;
+      await scanVideoMessages();
 
-          const metadata =
-            parseVideoMetadata(
-              message
-            );
-
-          return {
-            messageId:
-              Number(message.id),
-
-            metadata: {
-              course:
-                metadata.course,
-
-              module:
-                metadata.module,
-
-              videoId:
-                metadata.video,
-
-              title:
-                metadata.title
-            },
-
-            file: {
-              size:
-                Number(document.size),
-
-              sizeMB:
-                Number(document.size) /
-                (1024 * 1024),
-
-              mimeType:
-                document.mimeType ||
-                null,
-
-              fileName:
-                getDocumentFileName(
-                  document
-                )
-            }
-          };
-        })
+    const filteredVideos =
+      videos
         .filter((video) => {
           return (
             video.metadata.course &&
@@ -524,9 +463,10 @@ app.get("/library", async (req, res) => {
       success: true,
 
       count:
-        videos.length,
+        filteredVideos.length,
 
-      videos
+      videos:
+        filteredVideos
     });
 
   } catch (error) {
@@ -544,16 +484,192 @@ app.get("/library", async (req, res) => {
 
 
 // ==================================================
+// PHASE 2 — STEP 1
+// COURSE → MODULE → VIDEOS
+// ==================================================
+
+app.get("/courses", async (req, res) => {
+  try {
+    const videos =
+      await scanVideoMessages();
+
+    const validVideos =
+      videos.filter((video) => {
+        return (
+          video.metadata.course &&
+          video.metadata.module &&
+          video.metadata.videoId &&
+          video.metadata.title
+        );
+      });
+
+    const courseMap = new Map();
+
+    for (const video of validVideos) {
+      const courseName =
+        video.metadata.course;
+
+      const moduleName =
+        video.metadata.module;
+
+      // ----------------------------------------------
+      // CREATE COURSE
+      // ----------------------------------------------
+
+      if (!courseMap.has(courseName)) {
+        courseMap.set(
+          courseName,
+          {
+            course:
+              courseName,
+
+            modules: new Map()
+          }
+        );
+      }
+
+      const course =
+        courseMap.get(courseName);
+
+      // ----------------------------------------------
+      // CREATE MODULE
+      // ----------------------------------------------
+
+      if (
+        !course.modules.has(
+          moduleName
+        )
+      ) {
+        course.modules.set(
+          moduleName,
+          {
+            module:
+              moduleName,
+
+            videos: []
+          }
+        );
+      }
+
+      const module =
+        course.modules.get(
+          moduleName
+        );
+
+      // ----------------------------------------------
+      // ADD VIDEO
+      // ----------------------------------------------
+
+      module.videos.push({
+        messageId:
+          video.messageId,
+
+        videoId:
+          video.metadata.videoId,
+
+        title:
+          video.metadata.title,
+
+        file: {
+          size:
+            video.file.size,
+
+          sizeMB:
+            video.file.sizeMB,
+
+          mimeType:
+            video.file.mimeType,
+
+          fileName:
+            video.file.fileName
+        }
+      });
+    }
+
+    // ==================================================
+    // CONVERT MAPS TO JSON ARRAYS
+    // ==================================================
+
+    const courses =
+      Array.from(
+        courseMap.values()
+      ).map((course) => {
+
+        const modules =
+          Array.from(
+            course.modules.values()
+          ).map((module) => {
+
+            module.videos.sort(
+              (a, b) =>
+                a.messageId -
+                b.messageId
+            );
+
+            return module;
+          });
+
+        return {
+          course:
+            course.course,
+
+          moduleCount:
+            modules.length,
+
+          videoCount:
+            modules.reduce(
+              (total, module) =>
+                total +
+                module.videos.length,
+              0
+            ),
+
+          modules
+        };
+      });
+
+    // Sort courses alphabetically
+    courses.sort((a, b) =>
+      a.course.localeCompare(
+        b.course
+      )
+    );
+
+    res.json({
+      success: true,
+
+      courseCount:
+        courses.length,
+
+      videoCount:
+        validVideos.length,
+
+      courses
+    });
+
+  } catch (error) {
+    console.error(
+      "COURSES ERROR:",
+      error
+    );
+
+    res.status(500).json({
+      success: false,
+      error:
+        error.message
+    });
+  }
+});
+
+
+// ==================================================
 // VIDEO STREAM
-//
-// Examples:
 //
 // /video?messageId=19
 // /video?messageId=20
 //
-// Without messageId:
 // /video
-// -> latest video
+// → latest video
 // ==================================================
 
 app.get("/video", async (req, res) => {
@@ -594,14 +710,15 @@ app.get("/video", async (req, res) => {
       );
     }
 
-    // ----------------------------------------------
+    // ==================================================
     // RANGE REQUEST
-    // ----------------------------------------------
+    // ==================================================
 
     const range =
       req.headers.range;
 
     let start = 0;
+
     let end =
       fileSize - 1;
 
@@ -614,6 +731,7 @@ app.get("/video", async (req, res) => {
         );
 
       if (match) {
+
         if (match[1]) {
           start =
             Number(match[1]);
@@ -624,8 +742,9 @@ app.get("/video", async (req, res) => {
             Number(match[2]);
         }
 
-        // Suffix range:
+        // Suffix range
         // bytes=-500000
+
         if (
           !match[1] &&
           match[2]
@@ -633,11 +752,12 @@ app.get("/video", async (req, res) => {
           const suffixLength =
             Number(match[2]);
 
-          start = Math.max(
-            fileSize -
-              suffixLength,
-            0
-          );
+          start =
+            Math.max(
+              fileSize -
+                suffixLength,
+              0
+            );
 
           end =
             fileSize - 1;
@@ -658,10 +778,11 @@ app.get("/video", async (req, res) => {
           return res.end();
         }
 
-        end = Math.min(
-          end,
-          fileSize - 1
-        );
+        end =
+          Math.min(
+            end,
+            fileSize - 1
+          );
 
         statusCode = 206;
       }
@@ -670,11 +791,13 @@ app.get("/video", async (req, res) => {
     const contentLength =
       end - start + 1;
 
-    // ----------------------------------------------
+    // ==================================================
     // RESPONSE HEADERS
-    // ----------------------------------------------
+    // ==================================================
 
-    res.status(statusCode);
+    res.status(
+      statusCode
+    );
 
     res.setHeader(
       "Content-Type",
@@ -706,9 +829,9 @@ app.get("/video", async (req, res) => {
       "no-store"
     );
 
-    // ----------------------------------------------
+    // ==================================================
     // TELEGRAM STREAM
-    // ----------------------------------------------
+    // ==================================================
 
     const CHUNK_SIZE =
       512 * 1024;
@@ -758,6 +881,7 @@ app.get("/video", async (req, res) => {
     for await (
       const chunk of iterator
     ) {
+
       if (res.destroyed) {
         break;
       }
@@ -808,19 +932,25 @@ app.get("/video", async (req, res) => {
     res.end();
 
   } catch (error) {
+
     console.error(
       "VIDEO ERROR:",
       error
     );
 
     if (!res.headersSent) {
+
       res.status(500).json({
         success: false,
+
         error:
           error.message
       });
+
     } else {
+
       res.destroy();
+
     }
   }
 });
