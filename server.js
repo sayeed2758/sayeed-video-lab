@@ -189,6 +189,14 @@ async function findLatestVideoMessage() {
   return latestVideo;
 }
 
+function getDocumentFileName(document) {
+  const attribute = document.attributes?.find(
+    (item) =>
+      item.className === "DocumentAttributeFilename"
+  );
+
+  return attribute?.fileName || null;
+}
 // ==================================================
 // HEALTH
 // ==================================================
@@ -274,6 +282,117 @@ app.get("/latest", async (req, res) => {
   }
 });
 
+app.get("/library", async (req, res) => {
+  try {
+    const tg = await getClient();
+    const channel = await getChannel();
+
+    const messageIds = [];
+
+    for (
+      let id = SCAN_FROM;
+      id <= SCAN_TO;
+      id++
+    ) {
+      messageIds.push(
+        new Api.InputMessageID({
+          id
+        })
+      );
+    }
+
+    console.log(
+      `Scanning messages ${SCAN_FROM}-${SCAN_TO} for video library...`
+    );
+
+    const result = await tg.invoke(
+      new Api.channels.GetMessages({
+        channel: new Api.InputChannel({
+          channelId: channel.id,
+          accessHash: channel.accessHash
+        }),
+        id: messageIds
+      })
+    );
+
+    const messages = result.messages || [];
+
+    const videos = messages
+      .filter((message) => {
+        return (
+          message &&
+          message.media &&
+          message.media.document &&
+          message.media.document.mimeType &&
+          message.media.document.mimeType.startsWith(
+            "video/"
+          )
+        );
+      })
+      .map((message) => {
+        const document =
+          message.media.document;
+
+        const metadata =
+          parseVideoMetadata(message);
+
+        return {
+          messageId: Number(message.id),
+
+          metadata: {
+            course: metadata.course,
+            module: metadata.module,
+            videoId: metadata.video,
+            title: metadata.title
+          },
+
+          file: {
+            size: Number(document.size),
+
+            sizeMB:
+              Number(document.size) /
+              (1024 * 1024),
+
+            mimeType:
+              document.mimeType || null,
+
+            fileName:
+              getDocumentFileName(document)
+          }
+        };
+      })
+      .filter((video) => {
+        // Only include videos having our metadata format.
+        return (
+          video.metadata.course &&
+          video.metadata.module &&
+          video.metadata.videoId &&
+          video.metadata.title
+        );
+      })
+      .sort(
+        (a, b) =>
+          a.messageId - b.messageId
+      );
+
+    res.json({
+      success: true,
+      count: videos.length,
+      videos
+    });
+
+  } catch (error) {
+    console.error(
+      "LIBRARY ERROR:",
+      error
+    );
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
 
 // ==================================================
 // VIDEO STREAM
