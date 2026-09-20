@@ -14,19 +14,19 @@
     body {
       margin: 0;
       min-height: 100vh;
-      font-family: Arial, sans-serif;
+      padding: 20px;
       background: #07110d;
-      color: #fff;
+      color: white;
+      font-family: Arial, sans-serif;
       display: flex;
       justify-content: center;
       align-items: center;
-      padding: 20px;
     }
 
     .box {
       width: 100%;
-      max-width: 600px;
-      padding: 28px;
+      max-width: 650px;
+      padding: 24px;
       border: 1px solid #1f4d39;
       border-radius: 22px;
       background: #0c1913;
@@ -40,12 +40,12 @@
 
     p {
       color: #a8b8b0;
-      line-height: 1.6;
+      line-height: 1.5;
     }
 
     button {
       width: 100%;
-      margin-top: 18px;
+      margin-top: 15px;
       padding: 15px;
       border: 0;
       border-radius: 12px;
@@ -57,13 +57,29 @@
     }
 
     #status {
-      margin-top: 20px;
-      padding: 15px;
+      margin-top: 18px;
+      padding: 14px;
       border-radius: 12px;
       background: #07100c;
       color: #b8c9c0;
       white-space: pre-wrap;
       word-break: break-word;
+    }
+
+    .player {
+      display: none;
+      margin-top: 20px;
+      width: 100%;
+      border-radius: 16px;
+      overflow: hidden;
+      background: #000;
+    }
+
+    video {
+      display: block;
+      width: 100%;
+      max-height: 70vh;
+      background: #000;
     }
   </style>
 </head>
@@ -71,53 +87,87 @@
 <body>
 
   <div class="box">
+
     <h1>🎬 Sayeed Video Lab</h1>
 
     <p>
       Telegram Video Streaming — Proof of Concept
     </p>
 
-    <button onclick="checkTelegram()">
-      CHECK TEST VIDEO
+    <button onclick="loadVideo()">
+      ▶ PLAY TEST VIDEO
     </button>
 
     <div id="status">
       Ready for testing...
     </div>
+
+    <div class="player" id="playerBox">
+      <video
+        id="videoPlayer"
+        controls
+        playsinline
+        preload="metadata">
+      </video>
+    </div>
+
   </div>
 
   <script>
-    async function checkTelegram() {
-      const status = document.getElementById("status");
+    async function loadVideo() {
 
-      status.textContent = "Checking Telegram...";
+      const status = document.getElementById("status");
+      const playerBox = document.getElementById("playerBox");
+      const videoPlayer = document.getElementById("videoPlayer");
+
+      status.textContent = "🔄 Finding Telegram video...";
 
       try {
+
         const response = await fetch("/api/telegram");
 
         const data = await response.json();
 
         if (!response.ok) {
-          throw new Error(data.error || "Request failed");
+          throw new Error(data.error || "Telegram request failed");
         }
 
-        if (data.video) {
-          status.textContent =
-            "✅ Telegram video detected!\n\n" +
-            "File ID:\n" +
-            data.video.file_id +
-            "\n\nFile Size:\n" +
-            data.video.file_size +
-            " bytes";
-        } else {
-          status.textContent =
-            "⚠️ No video post detected yet.\n\n" +
-            JSON.stringify(data, null, 2);
+        if (!data.video || !data.video.file_id) {
+          throw new Error("No Telegram video found.");
         }
+
+        const fileId = data.video.file_id;
+
+        status.textContent =
+          "✅ Video found!\n\n" +
+          "Loading video player...";
+
+        /*
+         * Important:
+         * The Telegram Bot Token stays on the server.
+         * The browser only receives this internal
+         * Sayeed Video Lab endpoint.
+         */
+
+        const videoUrl =
+          "/api/video?file_id=" +
+          encodeURIComponent(fileId);
+
+        videoPlayer.src = videoUrl;
+
+        playerBox.style.display = "block";
+
+        videoPlayer.load();
+
+        status.textContent =
+          "✅ Telegram video connected.\n\n" +
+          "Press Play to start.";
 
       } catch (error) {
+
         status.textContent =
-          "❌ Error:\n\n" + error.message;
+          "❌ Error:\n\n" +
+          error.message;
       }
     }
   </script>
