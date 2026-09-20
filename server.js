@@ -1,6 +1,7 @@
 import express from "express";
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
+import bigInt from "big-integer";
 
 const app = express();
 
@@ -228,7 +229,7 @@ app.get("/video", async (req, res) => {
     for await (
       const chunk of tg.iterDownload({
         file: media,
-        offset: alignedStart,
+        offset: bigInt(start),
         limit: telegramLength,
         requestSize: 1024 * 1024
       })
