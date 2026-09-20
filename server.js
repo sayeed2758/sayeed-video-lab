@@ -12,16 +12,22 @@ const API_HASH = process.env.TELEGRAM_API_HASH;
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 const CHANNEL_ID = "-1004305906553";
-const MESSAGE_ID = 6;
+
+// Scan first 200 message IDs for this POC.
+// Telegram channels can return up to 200 message IDs per request.
+const SCAN_FROM = 1;
+const SCAN_TO = 200;
 
 const stringSession = new StringSession("");
 
 let tgClient = null;
-let videoMessage = null;
+let cachedChannel = null;
+let cachedVideoMessage = null;
 
-// --------------------------------------------------
+
+// ==================================================
 // TELEGRAM CLIENT
-// --------------------------------------------------
+// ==================================================
 
 async function getClient() {
   if (tgClient && tgClient.connected) {
@@ -46,13 +52,14 @@ async function getClient() {
   return tgClient;
 }
 
-// --------------------------------------------------
-// GET VIDEO MESSAGE
-// --------------------------------------------------
 
-async function getVideoMessage() {
-  if (videoMessage) {
-    return videoMessage;
+// ==================================================
+// GET CHANNEL
+// ==================================================
+
+async function getChannel() {
+  if (cachedChannel) {
+    return cachedChannel;
   }
 
   const tg = await getClient();
@@ -60,7 +67,7 @@ async function getVideoMessage() {
   const mtprotoChannelId =
     BigInt(-CHANNEL_ID) - 1000000000000n;
 
-  const channelResult = await tg.invoke(
+  const result = await tg.invoke(
     new Api.channels.GetChannels({
       id: [
         new Api.InputChannel({
@@ -71,7 +78,7 @@ async function getVideoMessage() {
     })
   );
 
-  const channel = channelResult.chats?.[0];
+  const channel = result.chats?.[0];
 
   if (!channel) {
     throw new Error(
@@ -79,42 +86,99 @@ async function getVideoMessage() {
     );
   }
 
-  const messagesResult = await tg.invoke(
+  cachedChannel = channel;
+
+  console.log(
+    `Channel resolved: ${channel.title || channel.id}`
+  );
+
+  return channel;
+}
+
+
+// ==================================================
+// FIND LATEST VIDEO
+// ==================================================
+
+async function findLatestVideoMessage() {
+  if (cachedVideoMessage) {
+    return cachedVideoMessage;
+  }
+
+  const tg = await getClient();
+  const channel = await getChannel();
+
+  const messageIds = [];
+
+  for (
+    let id = SCAN_FROM;
+    id <= SCAN_TO;
+    id++
+  ) {
+    messageIds.push(
+      new Api.InputMessageID({
+        id,
+      })
+    );
+  }
+
+  console.log(
+    `Scanning Telegram messages ${SCAN_FROM}-${SCAN_TO}...`
+  );
+
+  const result = await tg.invoke(
     new Api.channels.GetMessages({
       channel: new Api.InputChannel({
         channelId: channel.id,
         accessHash: channel.accessHash,
       }),
-      id: [
-        new Api.InputMessageID({
-          id: MESSAGE_ID,
-        }),
-      ],
+      id: messageIds,
     })
   );
 
-  const message = messagesResult.messages?.[0];
+  const messages = result.messages || [];
 
-  if (!message) {
+  const videos = messages.filter((message) => {
+    return (
+      message &&
+      message.media &&
+      message.media.document &&
+      message.media.document.mimeType &&
+      message.media.document.mimeType.startsWith(
+        "video/"
+      )
+    );
+  });
+
+  if (videos.length === 0) {
     throw new Error(
-      "Telegram video message not found."
+      "No video found in scanned Telegram messages."
     );
   }
 
-  if (!message.media) {
-    throw new Error(
-      "Telegram message does not contain media."
-    );
-  }
+  videos.sort(
+    (a, b) =>
+      Number(b.id) - Number(a.id)
+  );
 
-  videoMessage = message;
+  const latestVideo = videos[0];
 
-  return message;
+  cachedVideoMessage = latestVideo;
+
+  const document =
+    latestVideo.media.document;
+
+  console.log(
+    `Latest video found: message=${latestVideo.id}, size=${document.size}`
+  );
+
+  return latestVideo;
 }
 
-// --------------------------------------------------
-// HEALTH CHECK
-// --------------------------------------------------
+
+// ==================================================
+// HEALTH
+// ==================================================
 
 app.get("/health", async (req, res) => {
   try {
@@ -126,8 +190,12 @@ app.get("/health", async (req, res) => {
       telegram: "connected",
       bot: true,
     });
+
   } catch (error) {
-    console.error("HEALTH ERROR:", error);
+    console.error(
+      "HEALTH ERROR:",
+      error
+    );
 
     res.status(500).json({
       success: false,
@@ -136,25 +204,73 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// --------------------------------------------------
+
+// ==================================================
+// LATEST VIDEO INFO
+// ==================================================
+
+app.get("/latest", async (req, res) => {
+  try {
+    const message =
+      await findLatestVideoMessage();
+
+    const document =
+      message.media.document;
+
+    res.json({
+      success: true,
+
+      messageId: Number(message.id),
+
+      fileSize: Number(document.size),
+
+      fileSizeMB:
+        Number(document.size) /
+        (1024 * 1024),
+
+      mimeType:
+        document.mimeType || null,
+
+      fileName:
+        document.attributes
+          ?.find(
+            (attribute) =>
+              attribute.className ===
+              "DocumentAttributeFilename"
+          )
+          ?.fileName || null,
+    });
+
+  } catch (error) {
+    console.error(
+      "LATEST ERROR:",
+      error
+    );
+
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+
+// ==================================================
 // VIDEO STREAM
-// --------------------------------------------------
+// ==================================================
 
 app.get("/video", async (req, res) => {
   try {
     const tg = await getClient();
-    const message = await getVideoMessage();
+
+    const message =
+      await findLatestVideoMessage();
 
     const document =
-      message.media?.document;
+      message.media.document;
 
-    if (!document) {
-      throw new Error(
-        "Telegram message does not contain a video document."
-      );
-    }
-
-    const fileSize = Number(document.size);
+    const fileSize =
+      Number(document.size);
 
     if (!fileSize || fileSize <= 0) {
       throw new Error(
@@ -162,45 +278,55 @@ app.get("/video", async (req, res) => {
       );
     }
 
-    // ------------------------------------------------
-    // RANGE REQUEST
-    // ------------------------------------------------
-
-    const range = req.headers.range;
+    const range =
+      req.headers.range;
 
     let start = 0;
     let end = fileSize - 1;
     let statusCode = 200;
 
+    // ----------------------------------------------
+    // RANGE
+    // ----------------------------------------------
+
     if (range) {
-      const match = range.match(
-        /bytes=(\d*)-(\d*)/
-      );
+      const match =
+        range.match(
+          /bytes=(\d*)-(\d*)/
+        );
 
       if (match) {
         if (match[1]) {
-          start = Number(match[1]);
+          start =
+            Number(match[1]);
         }
 
         if (match[2]) {
-          end = Number(match[2]);
-        } else {
-          end = fileSize - 1;
+          end =
+            Number(match[2]);
         }
 
-        // Handle suffix range: bytes=-500000
-        if (!match[1] && match[2]) {
-          const suffixLength = Number(match[2]);
+        // bytes=-500000
+        if (
+          !match[1] &&
+          match[2]
+        ) {
+          const suffix =
+            Number(match[2]);
 
           start = Math.max(
-            fileSize - suffixLength,
+            fileSize - suffix,
             0
           );
 
-          end = fileSize - 1;
+          end =
+            fileSize - 1;
         }
 
-        if (start > end || start >= fileSize) {
+        if (
+          start > end ||
+          start >= fileSize
+        ) {
           res.status(416);
 
           res.setHeader(
@@ -223,15 +349,16 @@ app.get("/video", async (req, res) => {
     const contentLength =
       end - start + 1;
 
-    // ------------------------------------------------
+    // ----------------------------------------------
     // HEADERS
-    // ------------------------------------------------
+    // ----------------------------------------------
 
     res.status(statusCode);
 
     res.setHeader(
       "Content-Type",
-      "video/mp4"
+      document.mimeType ||
+        "video/mp4"
     );
 
     res.setHeader(
@@ -256,23 +383,27 @@ app.get("/video", async (req, res) => {
       "no-store"
     );
 
-    // ------------------------------------------------
-    // TELEGRAM DOWNLOAD
-    // ------------------------------------------------
+    // ----------------------------------------------
+    // TELEGRAM STREAM
+    // ----------------------------------------------
 
-    const CHUNK_SIZE = 512 * 1024;
+    const CHUNK_SIZE =
+      512 * 1024;
 
-    const offset = bigInt(start);
+    const offset =
+      bigInt(start);
 
     const requestedBytes =
       contentLength;
 
-    const chunkCount = Math.ceil(
-      requestedBytes / CHUNK_SIZE
-    );
+    const chunkCount =
+      Math.ceil(
+        requestedBytes /
+          CHUNK_SIZE
+      );
 
     console.log(
-      `Streaming video: ${start}-${end} / ${fileSize}`
+      `Streaming message ${message.id}: ${start}-${end}/${fileSize}`
     );
 
     console.log(
@@ -284,28 +415,39 @@ app.get("/video", async (req, res) => {
     const iterator =
       tg.iterDownload({
         file: message.media,
-        offset: offset,
-        requestSize: CHUNK_SIZE,
-        chunkSize: CHUNK_SIZE,
-        limit: chunkCount,
-        fileSize: bigInt(fileSize),
+        offset,
+        requestSize:
+          CHUNK_SIZE,
+        chunkSize:
+          CHUNK_SIZE,
+        limit:
+          chunkCount,
+        fileSize:
+          bigInt(fileSize),
       });
 
-    for await (const chunk of iterator) {
+    for await (
+      const chunk of iterator
+    ) {
       if (res.destroyed) {
         break;
       }
 
       const remaining =
-        requestedBytes - bytesSent;
+        requestedBytes -
+        bytesSent;
 
       if (remaining <= 0) {
         break;
       }
 
-      let outputChunk = chunk;
+      let outputChunk =
+        chunk;
 
-      if (chunk.length > remaining) {
+      if (
+        chunk.length >
+        remaining
+      ) {
         outputChunk =
           chunk.subarray(
             0,
@@ -313,20 +455,23 @@ app.get("/video", async (req, res) => {
           );
       }
 
-      res.write(outputChunk);
+      res.write(
+        outputChunk
+      );
 
       bytesSent +=
         outputChunk.length;
 
       if (
-        bytesSent >= requestedBytes
+        bytesSent >=
+        requestedBytes
       ) {
         break;
       }
     }
 
     console.log(
-      `Video stream finished: ${bytesSent} bytes sent`
+      `Stream finished: ${bytesSent} bytes`
     );
 
     res.end();
@@ -348,9 +493,10 @@ app.get("/video", async (req, res) => {
   }
 });
 
-// --------------------------------------------------
-// START SERVER
-// --------------------------------------------------
+
+// ==================================================
+// START
+// ==================================================
 
 app.listen(PORT, () => {
   console.log(
