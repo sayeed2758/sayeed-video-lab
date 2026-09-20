@@ -95,6 +95,28 @@ async function getChannel() {
   return channel;
 }
 
+function parseVideoMetadata(message) {
+  const text = message?.message || "";
+
+  const course =
+    text.match(/^COURSE:\s*(.+)$/im)?.[1]?.trim() || null;
+
+  const module =
+    text.match(/^MODULE:\s*(.+)$/im)?.[1]?.trim() || null;
+
+  const video =
+    text.match(/^VIDEO:\s*(.+)$/im)?.[1]?.trim() || null;
+
+  const title =
+    text.match(/^TITLE:\s*(.+)$/im)?.[1]?.trim() || null;
+
+  return {
+    course,
+    module,
+    video,
+    title
+  };
+}
 
 // ==================================================
 // FIND LATEST VIDEO
@@ -208,28 +230,35 @@ app.get("/latest", async (req, res) => {
     const document =
       message.media.document;
 
+    const metadata =
+      parseVideoMetadata(message);
+
     res.json({
       success: true,
 
       messageId: Number(message.id),
 
-      fileSize: Number(document.size),
+      metadata,
 
-      fileSizeMB:
-        Number(document.size) /
-        (1024 * 1024),
+      file: {
+        fileSize: Number(document.size),
 
-      mimeType:
-        document.mimeType || null,
+        fileSizeMB:
+          Number(document.size) /
+          (1024 * 1024),
 
-      fileName:
-        document.attributes
-          ?.find(
-            (attribute) =>
-              attribute.className ===
-              "DocumentAttributeFilename"
-          )
-          ?.fileName || null,
+        mimeType:
+          document.mimeType || null,
+
+        fileName:
+          document.attributes
+            ?.find(
+              (attribute) =>
+                attribute.className ===
+                "DocumentAttributeFilename"
+            )
+            ?.fileName || null
+      }
     });
 
   } catch (error) {
@@ -240,7 +269,7 @@ app.get("/latest", async (req, res) => {
 
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: error.message
     });
   }
 });
