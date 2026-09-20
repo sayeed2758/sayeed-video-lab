@@ -1,5 +1,5 @@
 import express from "express";
-import { TelegramClient } from "telegram";
+import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 
 const app = express();
@@ -64,26 +64,49 @@ async function getVideoMessage() {
 
   const tg = await getClient();
 
-  const dialogs = await tg.getDialogs({});
+  // Convert Bot API channel ID to MTProto channel ID.
+  const mtprotoChannelId =
+    BigInt(-CHANNEL_ID) - 1000000000000n;
 
-  const channel = dialogs.find(
-    dialog => String(dialog.id) === CHANNEL_ID
+  const result = await tg.invoke(
+    new Api.channels.GetChannels({
+      id: [
+        new Api.InputChannel({
+          channelId: mtprotoChannelId,
+          accessHash: 0n
+        })
+      ]
+    })
   );
+
+  const channel = result.chats?.[0];
 
   if (!channel) {
     throw new Error(
-      "Test channel not found. Make sure the bot is an admin of the channel."
+      "Telegram channel could not be resolved."
     );
   }
 
-  const messages = await tg.getMessages(channel.entity, {
-    ids: MESSAGE_ID
-  });
+  const messages = await tg.invoke(
+    new Api.channels.GetMessages({
+      channel: new Api.InputChannel({
+        channelId: channel.id,
+        accessHash: channel.accessHash
+      }),
+      id: [
+        new Api.InputMessageID({
+          id: MESSAGE_ID
+        })
+      ]
+    })
+  );
 
-  const message = messages[0];
+  const message = messages.messages?.[0];
 
   if (!message || !message.media) {
-    throw new Error("Test video message not found.");
+    throw new Error(
+      "Test video message not found."
+    );
   }
 
   videoMessage = message;
