@@ -1,6 +1,6 @@
 import express from "express";
 import { TelegramClient } from "telegram";
-import { StringSession } from "telegram/sessions";
+import { StringSession } from "telegram/sessions/index.js";
 
 const app = express();
 
