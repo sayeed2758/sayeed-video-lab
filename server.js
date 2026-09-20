@@ -5,6 +5,38 @@ import bigInt from "big-integer";
 
 const app = express();
 
+// ==================================================
+// CORS
+// ==================================================
+
+app.use((req, res, next) => {
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, OPTIONS"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Range, Content-Type"
+  );
+
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "Content-Length, Content-Range, Accept-Ranges, Content-Type"
+  );
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
 const PORT = process.env.PORT || 10000;
 
 const API_ID = Number(process.env.TELEGRAM_API_ID);
