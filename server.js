@@ -2,24 +2,69 @@ import express from "express";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import bigInt from "big-integer";
+import { cert, getApps, initializeApp } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
+import { getFirestore } from "firebase-admin/firestore";
 
 const app = express();
+
+// ==================================================
+// BASIC CONFIG
+// ==================================================
+
+const PORT = Number(process.env.PORT || 10000);
+const WEBSITE_ORIGIN = String(
+  process.env.WEBSITE_ORIGIN || "*"
+).trim();
+const VIDEO_SECURITY_MODE = String(
+  process.env.VIDEO_SECURITY_MODE || "test"
+).trim().toLowerCase();
+
+const API_ID = Number(process.env.TELEGRAM_API_ID);
+const API_HASH = process.env.TELEGRAM_API_HASH;
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+const CHANNEL_ID = "-1004305906553";
+
+// Current POC scan range. We will replace this with a production index/cache later.
+const SCAN_FROM = 1;
+const SCAN_TO = 200;
+const COURSE_CACHE_TTL_MS = 30_000;
+
+const stringSession = new StringSession("");
+
+let tgClient = null;
+let cachedChannel = null;
+let firebaseReady = false;
+let courseCache = {
+  data: null,
+  expiresAt: 0,
+  promise: null
+};
 
 // ==================================================
 // CORS
 // ==================================================
 
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    WEBSITE_ORIGIN
+  );
+
+  res.setHeader(
+    "Vary",
+    "Origin"
+  );
 
   res.setHeader(
     "Access-Control-Allow-Methods",
-    "GET, OPTIONS"
+    "GET, HEAD, OPTIONS"
   );
 
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Range, Content-Type"
+    "Authorization, Range, Content-Type"
   );
 
   res.setHeader(
@@ -34,23 +79,210 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT = process.env.PORT || 10000;
+app.disable("x-powered-by");
 
-const API_ID = Number(process.env.TELEGRAM_API_ID);
-const API_HASH = process.env.TELEGRAM_API_HASH;
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+// ==================================================
+// HELPERS
+// ==================================================
 
-const CHANNEL_ID = "-1004305906553";
+function httpError(message, statusCode) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
 
-// POC scan range
-const SCAN_FROM = 1;
-const SCAN_TO = 200;
+function parseBoolean(value, fallback = false) {
+  if (value === undefined || value === null) return fallback;
+  return ["1", "true", "yes", "on"].includes(
+    String(value).trim().toLowerCase()
+  );
+}
 
-const stringSession = new StringSession("");
+function requireTelegramConfig() {
+  if (!API_ID || !API_HASH || !BOT_TOKEN) {
+    throw new Error(
+      "Telegram environment variables are missing."
+    );
+  }
+}
 
-let tgClient = null;
-let cachedChannel = null;
+function getFirebaseServiceAccount() {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
+  if (!raw) {
+    throw new Error(
+      "FIREBASE_SERVICE_ACCOUNT_JSON is not configured."
+    );
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error(
+      "FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON."
+    );
+  }
+}
+
+function getFirebaseAdmin() {
+  if (firebaseReady) return;
+
+  if (getApps().length === 0) {
+    initializeApp({
+      credential: cert(getFirebaseServiceAccount())
+    });
+  }
+
+  firebaseReady = true;
+}
+
+async function verifyFirebaseUser(req) {
+  getFirebaseAdmin();
+
+  const authorization =
+    req.headers.authorization || "";
+
+  if (!authorization.startsWith("Bearer ")) {
+    throw httpError(
+      "Authentication required.",
+      401
+    );
+  }
+
+  const idToken = authorization
+    .slice("Bearer ".length)
+    .trim();
+
+  if (!idToken) {
+    throw httpError(
+      "Authentication token is missing.",
+      401
+    );
+  }
+
+  try {
+    return await getAuth().verifyIdToken(idToken);
+  } catch {
+    throw httpError(
+      "Invalid or expired Firebase authentication token.",
+      401
+    );
+  }
+}
+
+async function checkCourseEnrollment(uid, courseId) {
+  if (!uid) {
+    throw httpError("User ID is required.", 400);
+  }
+
+  if (!courseId) {
+    throw httpError("courseId is required.", 400);
+  }
+
+  getFirebaseAdmin();
+
+  const snapshot = await getFirestore()
+    .collection("enrollments")
+    .where("userId", "==", String(uid))
+    .where("courseId", "==", String(courseId))
+    .limit(1)
+    .get();
+
+  return !snapshot.empty;
+}
+
+async function requireCourseEnrollment(req, courseId) {
+  const decoded = await verifyFirebaseUser(req);
+  const enrolled = await checkCourseEnrollment(
+    decoded.uid,
+    courseId
+  );
+
+  if (!enrolled) {
+    throw httpError(
+      "You are not enrolled in this course.",
+      403
+    );
+  }
+
+  return decoded;
+}
+
+function parseVideoMetadata(message) {
+  const text = message?.message || "";
+
+  const course =
+    text.match(/^COURSE:\s*(.+)$/im)?.[1]?.trim() ||
+    null;
+
+  const module =
+    text.match(/^MODULE:\s*(.+)$/im)?.[1]?.trim() ||
+    null;
+
+  const video =
+    text.match(/^VIDEO:\s*(.+)$/im)?.[1]?.trim() ||
+    null;
+
+  const title =
+    text.match(/^TITLE:\s*(.+)$/im)?.[1]?.trim() ||
+    null;
+
+  return {
+    course,
+    module,
+    video,
+    title
+  };
+}
+
+function getDocumentFileName(document) {
+  const attribute = document.attributes?.find(
+    (item) =>
+      item.className ===
+      "DocumentAttributeFilename"
+  );
+
+  return attribute?.fileName || null;
+}
+
+function isVideoMessage(message) {
+  return Boolean(
+    message?.media?.document?.mimeType?.startsWith("video/")
+  );
+}
+
+function toVideoRecord(message) {
+  const document = message.media.document;
+  const metadata = parseVideoMetadata(message);
+
+  return {
+    messageId: Number(message.id),
+
+    metadata: {
+      course: metadata.course,
+      module: metadata.module,
+      videoId: metadata.video,
+      title: metadata.title
+    },
+
+    file: {
+      size: Number(document.size),
+      sizeMB:
+        Number(document.size) / (1024 * 1024),
+      mimeType: document.mimeType || null,
+      fileName: getDocumentFileName(document)
+    }
+  };
+}
+
+function hasCompleteMetadata(video) {
+  return Boolean(
+    video.metadata.course &&
+    video.metadata.module &&
+    video.metadata.videoId &&
+    video.metadata.title
+  );
+}
 
 // ==================================================
 // TELEGRAM CLIENT
@@ -61,11 +293,7 @@ async function getClient() {
     return tgClient;
   }
 
-  if (!API_ID || !API_HASH || !BOT_TOKEN) {
-    throw new Error(
-      "Telegram environment variables are missing."
-    );
-  }
+  requireTelegramConfig();
 
   tgClient = new TelegramClient(
     stringSession,
@@ -84,7 +312,6 @@ async function getClient() {
 
   return tgClient;
 }
-
 
 // ==================================================
 // GET CHANNEL
@@ -128,74 +355,8 @@ async function getChannel() {
   return channel;
 }
 
-
 // ==================================================
-// PARSE VIDEO METADATA
-// ==================================================
-
-function parseVideoMetadata(message) {
-  const text = message?.message || "";
-
-  const course =
-    text.match(/^COURSE:\s*(.+)$/im)?.[1]?.trim() ||
-    null;
-
-  const module =
-    text.match(/^MODULE:\s*(.+)$/im)?.[1]?.trim() ||
-    null;
-
-  const video =
-    text.match(/^VIDEO:\s*(.+)$/im)?.[1]?.trim() ||
-    null;
-
-  const title =
-    text.match(/^TITLE:\s*(.+)$/im)?.[1]?.trim() ||
-    null;
-
-  return {
-    course,
-    module,
-    video,
-    title
-  };
-}
-
-
-// ==================================================
-// GET DOCUMENT FILE NAME
-// ==================================================
-
-function getDocumentFileName(document) {
-  const attribute =
-    document.attributes?.find(
-      (item) =>
-        item.className ===
-        "DocumentAttributeFilename"
-    );
-
-  return attribute?.fileName || null;
-}
-
-
-// ==================================================
-// CHECK VIDEO MESSAGE
-// ==================================================
-
-function isVideoMessage(message) {
-  return Boolean(
-    message &&
-    message.media &&
-    message.media.document &&
-    message.media.document.mimeType &&
-    message.media.document.mimeType.startsWith(
-      "video/"
-    )
-  );
-}
-
-
-// ==================================================
-// GET VIDEO MESSAGE BY MESSAGE ID
+// GET VIDEO MESSAGE
 // ==================================================
 
 async function getVideoMessage(messageId) {
@@ -208,8 +369,9 @@ async function getVideoMessage(messageId) {
     !Number.isInteger(numericMessageId) ||
     numericMessageId <= 0
   ) {
-    throw new Error(
-      "Invalid Telegram message ID."
+    throw httpError(
+      "Invalid Telegram message ID.",
+      400
     );
   }
 
@@ -231,20 +393,21 @@ async function getVideoMessage(messageId) {
   const message = result.messages?.[0];
 
   if (!message) {
-    throw new Error(
-      `Telegram message ${numericMessageId} not found.`
+    throw httpError(
+      `Telegram message ${numericMessageId} not found.`,
+      404
     );
   }
 
   if (!isVideoMessage(message)) {
-    throw new Error(
-      `Message ${numericMessageId} is not a video.`
+    throw httpError(
+      `Message ${numericMessageId} is not a video.`,
+      400
     );
   }
 
   return message;
 }
-
 
 // ==================================================
 // SCAN TELEGRAM VIDEO MESSAGES
@@ -256,15 +419,9 @@ async function scanVideoMessages() {
 
   const messageIds = [];
 
-  for (
-    let id = SCAN_FROM;
-    id <= SCAN_TO;
-    id++
-  ) {
+  for (let id = SCAN_FROM; id <= SCAN_TO; id++) {
     messageIds.push(
-      new Api.InputMessageID({
-        id
-      })
+      new Api.InputMessageID({ id })
     );
   }
 
@@ -283,72 +440,272 @@ async function scanVideoMessages() {
     })
   );
 
-  const messages = result.messages || [];
-
-  const videos = messages
+  return (result.messages || [])
     .filter(isVideoMessage)
-    .map((message) => {
-      const document =
-        message.media.document;
-
-      const metadata =
-        parseVideoMetadata(message);
-
-      return {
-        messageId: Number(message.id),
-
-        metadata: {
-          course: metadata.course,
-          module: metadata.module,
-          videoId: metadata.video,
-          title: metadata.title
-        },
-
-        file: {
-          size: Number(document.size),
-
-          sizeMB:
-            Number(document.size) /
-            (1024 * 1024),
-
-          mimeType:
-            document.mimeType || null,
-
-          fileName:
-            getDocumentFileName(document)
-        }
-      };
-    });
-
-  return videos;
+    .map(toVideoRecord);
 }
 
+async function getCachedVideoLibrary(force = false) {
+  const now = Date.now();
 
-// ==================================================
-// FIND LATEST VIDEO
-// ==================================================
+  if (
+    !force &&
+    courseCache.data &&
+    now < courseCache.expiresAt
+  ) {
+    return courseCache.data;
+  }
+
+  if (!force && courseCache.promise) {
+    return courseCache.promise;
+  }
+
+  courseCache.promise = scanVideoMessages()
+    .then((videos) => {
+      courseCache = {
+        data: videos,
+        expiresAt: Date.now() + COURSE_CACHE_TTL_MS,
+        promise: null
+      };
+
+      return videos;
+    })
+    .catch((error) => {
+      courseCache.promise = null;
+      throw error;
+    });
+
+  return courseCache.promise;
+}
 
 async function findLatestVideoMessage() {
-  const videos =
-    await scanVideoMessages();
+  const videos = await getCachedVideoLibrary();
 
   if (videos.length === 0) {
-    throw new Error(
-      "No video found in scanned Telegram messages."
+    throw httpError(
+      "No video found in scanned Telegram messages.",
+      404
     );
   }
 
   videos.sort(
-    (a, b) =>
-      b.messageId -
-      a.messageId
+    (a, b) => b.messageId - a.messageId
   );
 
-  return getVideoMessage(
-    videos[0].messageId
-  );
+  return getVideoMessage(videos[0].messageId);
 }
 
+function buildCourseCatalogue(videos) {
+  const validVideos = videos.filter(hasCompleteMetadata);
+  const courseMap = new Map();
+
+  for (const video of validVideos) {
+    const courseName = video.metadata.course;
+    const moduleName = video.metadata.module;
+
+    if (!courseMap.has(courseName)) {
+      courseMap.set(courseName, {
+        course: courseName,
+        modules: new Map()
+      });
+    }
+
+    const course = courseMap.get(courseName);
+
+    if (!course.modules.has(moduleName)) {
+      course.modules.set(moduleName, {
+        module: moduleName,
+        videos: []
+      });
+    }
+
+    const module = course.modules.get(moduleName);
+
+    module.videos.push({
+      messageId: video.messageId,
+      videoId: video.metadata.videoId,
+      title: video.metadata.title,
+      file: {
+        size: video.file.size,
+        sizeMB: video.file.sizeMB,
+        mimeType: video.file.mimeType,
+        fileName: video.file.fileName
+      }
+    });
+  }
+
+  const courses = Array.from(courseMap.values())
+    .map((course) => {
+      const modules = Array.from(course.modules.values())
+        .map((module) => ({
+          ...module,
+          videos: module.videos.sort(
+            (a, b) => a.messageId - b.messageId
+          )
+        }))
+        .sort((a, b) =>
+          String(a.module).localeCompare(String(b.module), undefined, {
+            numeric: true,
+            sensitivity: "base"
+          })
+        );
+
+      return {
+        course: course.course,
+        moduleCount: modules.length,
+        videoCount: modules.reduce(
+          (total, module) => total + module.videos.length,
+          0
+        ),
+        modules
+      };
+    })
+    .sort((a, b) =>
+      String(a.course).localeCompare(String(b.course), undefined, {
+        sensitivity: "base"
+      })
+    );
+
+  return {
+    courseCount: courses.length,
+    videoCount: validVideos.length,
+    courses
+  };
+}
+
+async function streamTelegramVideo(req, res, message) {
+  const tg = await getClient();
+  const document = message.media.document;
+  const fileSize = Number(document.size);
+
+  if (!fileSize || fileSize <= 0) {
+    throw new Error(
+      "Invalid Telegram video file size."
+    );
+  }
+
+  const range = req.headers.range;
+  let start = 0;
+  let end = fileSize - 1;
+  let statusCode = 200;
+
+  if (range) {
+    const match = range.match(/bytes=(\d*)-(\d*)/);
+
+    if (!match) {
+      throw httpError("Invalid Range header.", 416);
+    }
+
+    if (match[1]) {
+      start = Number(match[1]);
+    }
+
+    if (match[2]) {
+      end = Number(match[2]);
+    }
+
+    if (!match[1] && match[2]) {
+      const suffixLength = Number(match[2]);
+
+      if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
+        throw httpError("Invalid Range header.", 416);
+      }
+
+      start = Math.max(fileSize - suffixLength, 0);
+      end = fileSize - 1;
+    }
+
+    if (
+      start < 0 ||
+      start >= fileSize ||
+      start > end
+    ) {
+      res.status(416);
+      res.setHeader(
+        "Content-Range",
+        `bytes */${fileSize}`
+      );
+      return res.end();
+    }
+
+    end = Math.min(end, fileSize - 1);
+    statusCode = 206;
+  }
+
+  const contentLength = end - start + 1;
+
+  res.status(statusCode);
+  res.setHeader(
+    "Content-Type",
+    document.mimeType || "video/mp4"
+  );
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Content-Length", contentLength);
+
+  if (statusCode === 206) {
+    res.setHeader(
+      "Content-Range",
+      `bytes ${start}-${end}/${fileSize}`
+    );
+  }
+
+  res.setHeader(
+    "Cache-Control",
+    "private, no-store, no-cache, must-revalidate"
+  );
+
+  const CHUNK_SIZE = 512 * 1024;
+  const offset = bigInt(start);
+  const requestedBytes = contentLength;
+  const chunkCount = Math.ceil(
+    requestedBytes / CHUNK_SIZE
+  );
+
+  console.log(
+    `Streaming message ${message.id}: ${start}-${end}/${fileSize}`
+  );
+  console.log(`Chunks required: ${chunkCount}`);
+
+  let bytesSent = 0;
+
+  const iterator = tg.iterDownload({
+    file: message.media,
+    offset,
+    requestSize: CHUNK_SIZE,
+    chunkSize: CHUNK_SIZE,
+    limit: chunkCount,
+    fileSize: bigInt(fileSize)
+  });
+
+  try {
+    for await (const chunk of iterator) {
+      if (res.destroyed) break;
+
+      const remaining = requestedBytes - bytesSent;
+
+      if (remaining <= 0) break;
+
+      let outputChunk = chunk;
+
+      if (chunk.length > remaining) {
+        outputChunk = chunk.subarray(0, remaining);
+      }
+
+      res.write(outputChunk);
+      bytesSent += outputChunk.length;
+
+      if (bytesSent >= requestedBytes) break;
+    }
+  } finally {
+    console.log(
+      `Stream finished: ${bytesSent} bytes`
+    );
+  }
+
+  if (!res.destroyed) {
+    res.end();
+  }
+}
 
 // ==================================================
 // HEALTH
@@ -360,16 +717,17 @@ app.get("/health", async (req, res) => {
 
     res.json({
       success: true,
-      server: "Sayeed Video Lab",
+      server: "Sayeed Courses Video API",
       telegram: "connected",
+      firebaseAdminConfigured: Boolean(
+        process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+      ),
+      securityMode: VIDEO_SECURITY_MODE,
+      websiteOrigin: WEBSITE_ORIGIN,
       bot: true
     });
-
   } catch (error) {
-    console.error(
-      "HEALTH ERROR:",
-      error
-    );
+    console.error("HEALTH ERROR:", error);
 
     res.status(500).json({
       success: false,
@@ -378,6 +736,42 @@ app.get("/health", async (req, res) => {
   }
 });
 
+// ==================================================
+// SECURE ENROLLMENT CHECK
+//
+// GET /access?courseId=2
+// Authorization: Bearer <Firebase ID token>
+// ==================================================
+
+app.get("/access", async (req, res) => {
+  try {
+    const courseId = String(req.query.courseId || "").trim();
+
+    if (!courseId) {
+      throw httpError("courseId is required.", 400);
+    }
+
+    const decoded = await verifyFirebaseUser(req);
+    const enrolled = await checkCourseEnrollment(
+      decoded.uid,
+      courseId
+    );
+
+    res.json({
+      success: true,
+      authenticated: true,
+      enrolled,
+      courseId
+    });
+  } catch (error) {
+    console.error("ACCESS ERROR:", error);
+
+    res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.message || "Access check failed."
+    });
+  }
+});
 
 // ==================================================
 // LATEST VIDEO INFO
@@ -385,54 +779,30 @@ app.get("/health", async (req, res) => {
 
 app.get("/latest", async (req, res) => {
   try {
-    const message =
-      await findLatestVideoMessage();
-
-    const document =
-      message.media.document;
-
-    const metadata =
-      parseVideoMetadata(message);
+    const message = await findLatestVideoMessage();
+    const document = message.media.document;
+    const metadata = parseVideoMetadata(message);
 
     res.json({
       success: true,
-
-      messageId:
-        Number(message.id),
-
+      messageId: Number(message.id),
       metadata,
-
       file: {
-        fileSize:
-          Number(document.size),
-
-        fileSizeMB:
-          Number(document.size) /
-          (1024 * 1024),
-
-        mimeType:
-          document.mimeType || null,
-
-        fileName:
-          getDocumentFileName(
-            document
-          )
+        fileSize: Number(document.size),
+        fileSizeMB: Number(document.size) / (1024 * 1024),
+        mimeType: document.mimeType || null,
+        fileName: getDocumentFileName(document)
       }
     });
-
   } catch (error) {
-    console.error(
-      "LATEST ERROR:",
-      error
-    );
+    console.error("LATEST ERROR:", error);
 
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
       error: error.message
     });
   }
 });
-
 
 // ==================================================
 // FLAT VIDEO LIBRARY
@@ -440,531 +810,171 @@ app.get("/latest", async (req, res) => {
 
 app.get("/library", async (req, res) => {
   try {
-    const videos =
-      await scanVideoMessages();
+    const force = parseBoolean(req.query.refresh, false);
+    const videos = await getCachedVideoLibrary(force);
 
-    const filteredVideos =
-      videos
-        .filter((video) => {
-          return (
-            video.metadata.course &&
-            video.metadata.module &&
-            video.metadata.videoId &&
-            video.metadata.title
-          );
-        })
-        .sort(
-          (a, b) =>
-            a.messageId -
-            b.messageId
-        );
+    const filteredVideos = videos
+      .filter(hasCompleteMetadata)
+      .sort((a, b) => a.messageId - b.messageId);
 
     res.json({
       success: true,
-
-      count:
-        filteredVideos.length,
-
-      videos:
-        filteredVideos
+      count: filteredVideos.length,
+      videos: filteredVideos
     });
-
   } catch (error) {
-    console.error(
-      "LIBRARY ERROR:",
-      error
-    );
+    console.error("LIBRARY ERROR:", error);
 
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
       error: error.message
     });
   }
 });
 
-
 // ==================================================
-// PHASE 2 — STEP 1
 // COURSE → MODULE → VIDEOS
 // ==================================================
 
 app.get("/courses", async (req, res) => {
   try {
-    const videos =
-      await scanVideoMessages();
-
-    const validVideos =
-      videos.filter((video) => {
-        return (
-          video.metadata.course &&
-          video.metadata.module &&
-          video.metadata.videoId &&
-          video.metadata.title
-        );
-      });
-
-    const courseMap = new Map();
-
-    for (const video of validVideos) {
-      const courseName =
-        video.metadata.course;
-
-      const moduleName =
-        video.metadata.module;
-
-      // ----------------------------------------------
-      // CREATE COURSE
-      // ----------------------------------------------
-
-      if (!courseMap.has(courseName)) {
-        courseMap.set(
-          courseName,
-          {
-            course:
-              courseName,
-
-            modules: new Map()
-          }
-        );
-      }
-
-      const course =
-        courseMap.get(courseName);
-
-      // ----------------------------------------------
-      // CREATE MODULE
-      // ----------------------------------------------
-
-      if (
-        !course.modules.has(
-          moduleName
-        )
-      ) {
-        course.modules.set(
-          moduleName,
-          {
-            module:
-              moduleName,
-
-            videos: []
-          }
-        );
-      }
-
-      const module =
-        course.modules.get(
-          moduleName
-        );
-
-      // ----------------------------------------------
-      // ADD VIDEO
-      // ----------------------------------------------
-
-      module.videos.push({
-        messageId:
-          video.messageId,
-
-        videoId:
-          video.metadata.videoId,
-
-        title:
-          video.metadata.title,
-
-        file: {
-          size:
-            video.file.size,
-
-          sizeMB:
-            video.file.sizeMB,
-
-          mimeType:
-            video.file.mimeType,
-
-          fileName:
-            video.file.fileName
-        }
-      });
-    }
-
-    // ==================================================
-    // CONVERT MAPS TO JSON ARRAYS
-    // ==================================================
-
-    const courses =
-      Array.from(
-        courseMap.values()
-      ).map((course) => {
-
-        const modules =
-          Array.from(
-            course.modules.values()
-          ).map((module) => {
-
-            module.videos.sort(
-              (a, b) =>
-                a.messageId -
-                b.messageId
-            );
-
-            return module;
-          });
-
-        return {
-          course:
-            course.course,
-
-          moduleCount:
-            modules.length,
-
-          videoCount:
-            modules.reduce(
-              (total, module) =>
-                total +
-                module.videos.length,
-              0
-            ),
-
-          modules
-        };
-      });
-
-    // Sort courses alphabetically
-    courses.sort((a, b) =>
-      a.course.localeCompare(
-        b.course
-      )
-    );
+    const force = parseBoolean(req.query.refresh, false);
+    const videos = await getCachedVideoLibrary(force);
+    const catalogue = buildCourseCatalogue(videos);
 
     res.json({
       success: true,
-
-      courseCount:
-        courses.length,
-
-      videoCount:
-        validVideos.length,
-
-      courses
+      ...catalogue,
+      cachedForMs: COURSE_CACHE_TTL_MS
     });
-
   } catch (error) {
-    console.error(
-      "COURSES ERROR:",
-      error
-    );
+    console.error("COURSES ERROR:", error);
 
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
-      error:
-        error.message
+      error: error.message
     });
   }
 });
-
 
 // ==================================================
 // VIDEO STREAM
 //
-// /video?messageId=19
-// /video?messageId=20
+// Phase 1 compatibility mode:
+//   VIDEO_SECURITY_MODE=test      -> current test player keeps working.
+//   VIDEO_SECURITY_MODE=protected -> Firebase auth + enrollment required.
 //
-// /video
-// → latest video
+// Protected mode expects:
+//   /video?messageId=19&courseId=2
+//   Authorization: Bearer <Firebase ID token>
+//
+// We will switch this to short-lived playback access in the next phase.
 // ==================================================
 
-app.get("/video", async (req, res) => {
+async function handleVideoRequest(req, res) {
   try {
-    const tg =
-      await getClient();
+    let courseId = String(req.query.courseId || "").trim();
 
-    const requestedMessageId =
-      req.query.messageId;
+    if (VIDEO_SECURITY_MODE === "protected") {
+      if (!courseId) {
+        throw httpError(
+          "courseId is required for protected video access.",
+          400
+        );
+      }
 
+      await requireCourseEnrollment(req, courseId);
+    }
+
+    const requestedMessageId = req.query.messageId;
     let message;
 
-    if (
-      requestedMessageId !==
-      undefined
-    ) {
-      message =
-        await getVideoMessage(
-          requestedMessageId
-        );
+    if (requestedMessageId !== undefined) {
+      message = await getVideoMessage(requestedMessageId);
     } else {
-      message =
-        await findLatestVideoMessage();
+      message = await findLatestVideoMessage();
     }
 
-    const document =
-      message.media.document;
+    return streamTelegramVideo(req, res, message);
+  } catch (error) {
+    console.error("VIDEO ERROR:", error);
 
-    const fileSize =
-      Number(document.size);
-
-    if (
-      !fileSize ||
-      fileSize <= 0
-    ) {
-      throw new Error(
-        "Invalid Telegram video file size."
-      );
+    if (res.headersSent) {
+      return res.destroy();
     }
 
-    // ==================================================
-    // RANGE REQUEST
-    // ==================================================
+    res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.message || "Video streaming failed."
+    });
+  }
+}
 
-    const range =
-      req.headers.range;
+app.get("/video", handleVideoRequest);
 
-    let start = 0;
+// HEAD is useful for player/network checks. It does not download the video.
+app.head("/video", async (req, res) => {
+  try {
+    const requestedMessageId = req.query.messageId;
+    let message;
 
-    let end =
-      fileSize - 1;
-
-    let statusCode = 200;
-
-    if (range) {
-      const match =
-        range.match(
-          /bytes=(\d*)-(\d*)/
+    if (VIDEO_SECURITY_MODE === "protected") {
+      const courseId = String(req.query.courseId || "").trim();
+      if (!courseId) {
+        throw httpError(
+          "courseId is required for protected video access.",
+          400
         );
-
-      if (match) {
-
-        if (match[1]) {
-          start =
-            Number(match[1]);
-        }
-
-        if (match[2]) {
-          end =
-            Number(match[2]);
-        }
-
-        // Suffix range
-        // bytes=-500000
-
-        if (
-          !match[1] &&
-          match[2]
-        ) {
-          const suffixLength =
-            Number(match[2]);
-
-          start =
-            Math.max(
-              fileSize -
-                suffixLength,
-              0
-            );
-
-          end =
-            fileSize - 1;
-        }
-
-        if (
-          start < 0 ||
-          start >= fileSize ||
-          start > end
-        ) {
-          res.status(416);
-
-          res.setHeader(
-            "Content-Range",
-            `bytes */${fileSize}`
-          );
-
-          return res.end();
-        }
-
-        end =
-          Math.min(
-            end,
-            fileSize - 1
-          );
-
-        statusCode = 206;
       }
+      await requireCourseEnrollment(req, courseId);
     }
 
-    const contentLength =
-      end - start + 1;
+    if (requestedMessageId !== undefined) {
+      message = await getVideoMessage(requestedMessageId);
+    } else {
+      message = await findLatestVideoMessage();
+    }
 
-    // ==================================================
-    // RESPONSE HEADERS
-    // ==================================================
+    const document = message.media.document;
+    const fileSize = Number(document.size);
 
-    res.status(
-      statusCode
-    );
-
+    res.status(200);
     res.setHeader(
       "Content-Type",
-      document.mimeType ||
-        "video/mp4"
+      document.mimeType || "video/mp4"
     );
-
-    res.setHeader(
-      "Accept-Ranges",
-      "bytes"
-    );
-
-    res.setHeader(
-      "Content-Length",
-      contentLength
-    );
-
-    if (
-      statusCode === 206
-    ) {
-      res.setHeader(
-        "Content-Range",
-        `bytes ${start}-${end}/${fileSize}`
-      );
-    }
-
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Content-Length", fileSize);
     res.setHeader(
       "Cache-Control",
-      "no-store"
+      "private, no-store, no-cache, must-revalidate"
     );
-
-    // ==================================================
-    // TELEGRAM STREAM
-    // ==================================================
-
-    const CHUNK_SIZE =
-      512 * 1024;
-
-    const offset =
-      bigInt(start);
-
-    const requestedBytes =
-      contentLength;
-
-    const chunkCount =
-      Math.ceil(
-        requestedBytes /
-          CHUNK_SIZE
-      );
-
-    console.log(
-      `Streaming message ${message.id}: ${start}-${end}/${fileSize}`
-    );
-
-    console.log(
-      `Chunks required: ${chunkCount}`
-    );
-
-    let bytesSent = 0;
-
-    const iterator =
-      tg.iterDownload({
-        file:
-          message.media,
-
-        offset,
-
-        requestSize:
-          CHUNK_SIZE,
-
-        chunkSize:
-          CHUNK_SIZE,
-
-        limit:
-          chunkCount,
-
-        fileSize:
-          bigInt(fileSize)
-      });
-
-    for await (
-      const chunk of iterator
-    ) {
-
-      if (res.destroyed) {
-        break;
-      }
-
-      const remaining =
-        requestedBytes -
-        bytesSent;
-
-      if (
-        remaining <= 0
-      ) {
-        break;
-      }
-
-      let outputChunk =
-        chunk;
-
-      if (
-        chunk.length >
-        remaining
-      ) {
-        outputChunk =
-          chunk.subarray(
-            0,
-            remaining
-          );
-      }
-
-      res.write(
-        outputChunk
-      );
-
-      bytesSent +=
-        outputChunk.length;
-
-      if (
-        bytesSent >=
-        requestedBytes
-      ) {
-        break;
-      }
-    }
-
-    console.log(
-      `Stream finished: ${bytesSent} bytes`
-    );
-
-    res.end();
-
+    return res.end();
   } catch (error) {
-
-    console.error(
-      "VIDEO ERROR:",
-      error
-    );
-
-    if (!res.headersSent) {
-
-      res.status(500).json({
-        success: false,
-
-        error:
-          error.message
-      });
-
-    } else {
-
-      res.destroy();
-
-    }
+    res.status(error.statusCode || 500).end();
   }
 });
 
+// ==================================================
+// ERROR FALLBACK
+// ==================================================
+
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: "Endpoint not found."
+  });
+});
 
 // ==================================================
 // START SERVER
 // ==================================================
 
-app.listen(
-  PORT,
-  () => {
-    console.log(
-      `Sayeed Video Lab server running on port ${PORT}`
-    );
-  }
-);
+app.listen(PORT, () => {
+  console.log(
+    `Sayeed Courses Video API running on port ${PORT}`
+  );
+  console.log(
+    `Video security mode: ${VIDEO_SECURITY_MODE}`
+  );
+});

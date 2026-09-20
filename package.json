@@ -1,13 +1,17 @@
 {
   "name": "sayeed-video-lab",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "express": "^5.1.0",
+    "firebase-admin": "^13.6.0",
     "telegram": "^2.26.22",
     "big-integer": "^1.6.52"
   }
