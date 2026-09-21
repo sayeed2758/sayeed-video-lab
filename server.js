@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "node:crypto";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import bigInt from "big-integer";
@@ -19,6 +20,13 @@ const WEBSITE_ORIGIN = String(
 const VIDEO_SECURITY_MODE = String(
   process.env.VIDEO_SECURITY_MODE || "test"
 ).trim().toLowerCase();
+const PLAYBACK_SIGNING_SECRET = String(
+  process.env.PLAYBACK_SIGNING_SECRET || ""
+).trim();
+const PLAYBACK_TOKEN_TTL_SECONDS = Math.min(
+  Math.max(Number(process.env.PLAYBACK_TOKEN_TTL_SECONDS || 600), 60),
+  1800
+);
 
 const API_ID = Number(process.env.TELEGRAM_API_ID);
 const API_HASH = process.env.TELEGRAM_API_HASH;
@@ -89,6 +97,72 @@ function httpError(message, statusCode) {
   const error = new Error(message);
   error.statusCode = statusCode;
   return error;
+}
+
+function requirePlaybackSigningSecret() {
+  if (PLAYBACK_SIGNING_SECRET.length < 32) {
+    throw new Error(
+      "PLAYBACK_SIGNING_SECRET is not configured or is too short. Use a random secret of at least 32 characters."
+    );
+  }
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+function base64UrlDecode(value) {
+  return Buffer.from(value, "base64url").toString("utf8");
+}
+
+function signPlaybackPayload(encodedPayload) {
+  return crypto
+    .createHmac("sha256", PLAYBACK_SIGNING_SECRET)
+    .update(encodedPayload)
+    .digest("base64url");
+}
+
+function createPlaybackToken({ courseId, messageId, uid }) {
+  requirePlaybackSigningSecret();
+  const payload = {
+    courseId: String(courseId),
+    messageId: Number(messageId),
+    uid: String(uid),
+    exp: Math.floor(Date.now() / 1000) + PLAYBACK_TOKEN_TTL_SECONDS
+  };
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const signature = signPlaybackPayload(encodedPayload);
+  return `${encodedPayload}.${signature}`;
+}
+
+function verifyPlaybackToken(token) {
+  requirePlaybackSigningSecret();
+  if (!token || typeof token !== "string") {
+    throw httpError("Playback token is required.", 401);
+  }
+  const [encodedPayload, signature] = token.split(".");
+  if (!encodedPayload || !signature) {
+    throw httpError("Invalid playback token.", 401);
+  }
+  const expected = signPlaybackPayload(encodedPayload);
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (actualBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(actualBuffer, expectedBuffer)) {
+    throw httpError("Invalid playback token.", 401);
+  }
+  let payload;
+  try {
+    payload = JSON.parse(base64UrlDecode(encodedPayload));
+  } catch {
+    throw httpError("Invalid playback token.", 401);
+  }
+  if (!payload?.courseId || !payload?.uid || !Number.isInteger(Number(payload.messageId)) || Number(payload.messageId) <= 0) {
+    throw httpError("Invalid playback token.", 401);
+  }
+  if (Number(payload.exp) <= Math.floor(Date.now() / 1000)) {
+    throw httpError("Playback token has expired. Start playback again.", 401);
+  }
+  return payload;
 }
 
 function parseBoolean(value, fallback = false) {
@@ -722,6 +796,8 @@ app.get("/health", async (req, res) => {
       firebaseAdminConfigured: Boolean(
         process.env.FIREBASE_SERVICE_ACCOUNT_JSON
       ),
+      playbackSigningConfigured: PLAYBACK_SIGNING_SECRET.length >= 32,
+      playbackTokenTtlSeconds: PLAYBACK_TOKEN_TTL_SECONDS,
       securityMode: VIDEO_SECURITY_MODE,
       websiteOrigin: WEBSITE_ORIGIN,
       bot: true
@@ -769,6 +845,58 @@ app.get("/access", async (req, res) => {
     res.status(error.statusCode || 500).json({
       success: false,
       error: error.message || "Access check failed."
+    });
+  }
+});
+
+// ==================================================
+// SHORT-LIVED PLAYBACK ACCESS
+//
+// The website sends Firebase Authorization here once.
+// The returned signed URL can be used by a native <video> element
+// without exposing a Firebase token in the media request.
+// ==================================================
+
+app.get("/playback", async (req, res) => {
+  try {
+    const courseId = String(req.query.courseId || "").trim();
+    const messageId = Number(req.query.messageId);
+
+    if (!courseId) {
+      throw httpError("courseId is required.", 400);
+    }
+
+    if (!Number.isInteger(messageId) || messageId <= 0) {
+      throw httpError("A valid messageId is required.", 400);
+    }
+
+    const decoded = await requireCourseEnrollment(req, courseId);
+    requirePlaybackSigningSecret();
+
+    const token = createPlaybackToken({
+      courseId,
+      messageId,
+      uid: decoded.uid
+    });
+
+    const url = new URL("/video", `${req.protocol}://${req.get("host")}`);
+    url.searchParams.set("messageId", String(messageId));
+    url.searchParams.set("courseId", courseId);
+    url.searchParams.set("token", token);
+
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json({
+      success: true,
+      courseId,
+      messageId,
+      expiresIn: PLAYBACK_TOKEN_TTL_SECONDS,
+      playbackUrl: url.toString()
+    });
+  } catch (error) {
+    console.error("PLAYBACK ERROR:", error);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.message || "Playback access failed."
     });
   }
 });
@@ -873,26 +1001,39 @@ app.get("/courses", async (req, res) => {
 
 async function handleVideoRequest(req, res) {
   try {
-    let courseId = String(req.query.courseId || "").trim();
+    const courseId = String(req.query.courseId || "").trim();
+    const playbackToken = String(req.query.token || "").trim();
+    const requestedMessageId = req.query.messageId;
+    let message;
 
-    if (VIDEO_SECURITY_MODE === "protected") {
+    if (playbackToken) {
+      const payload = verifyPlaybackToken(playbackToken);
+      if (courseId && payload.courseId !== courseId) {
+        throw httpError("Playback token does not match this course.", 403);
+      }
+      if (requestedMessageId !== undefined && Number(payload.messageId) !== Number(requestedMessageId)) {
+        throw httpError("Playback token does not match this video.", 403);
+      }
+      message = await getVideoMessage(payload.messageId);
+    } else if (VIDEO_SECURITY_MODE === "protected") {
       if (!courseId) {
         throw httpError(
           "courseId is required for protected video access.",
           400
         );
       }
-
       await requireCourseEnrollment(req, courseId);
-    }
-
-    const requestedMessageId = req.query.messageId;
-    let message;
-
-    if (requestedMessageId !== undefined) {
-      message = await getVideoMessage(requestedMessageId);
+      if (requestedMessageId !== undefined) {
+        message = await getVideoMessage(requestedMessageId);
+      } else {
+        message = await findLatestVideoMessage();
+      }
     } else {
-      message = await findLatestVideoMessage();
+      if (requestedMessageId !== undefined) {
+        message = await getVideoMessage(requestedMessageId);
+      } else {
+        message = await findLatestVideoMessage();
+      }
     }
 
     return streamTelegramVideo(req, res, message);
@@ -916,10 +1057,17 @@ app.get("/video", handleVideoRequest);
 app.head("/video", async (req, res) => {
   try {
     const requestedMessageId = req.query.messageId;
+    const courseId = String(req.query.courseId || "").trim();
+    const playbackToken = String(req.query.token || "").trim();
     let message;
 
-    if (VIDEO_SECURITY_MODE === "protected") {
-      const courseId = String(req.query.courseId || "").trim();
+    if (playbackToken) {
+      const payload = verifyPlaybackToken(playbackToken);
+      if (courseId && payload.courseId !== courseId) {
+        throw httpError("Playback token does not match this course.", 403);
+      }
+      message = await getVideoMessage(payload.messageId);
+    } else if (VIDEO_SECURITY_MODE === "protected") {
       if (!courseId) {
         throw httpError(
           "courseId is required for protected video access.",
@@ -927,12 +1075,13 @@ app.head("/video", async (req, res) => {
         );
       }
       await requireCourseEnrollment(req, courseId);
-    }
-
-    if (requestedMessageId !== undefined) {
-      message = await getVideoMessage(requestedMessageId);
+      message = requestedMessageId !== undefined
+        ? await getVideoMessage(requestedMessageId)
+        : await findLatestVideoMessage();
     } else {
-      message = await findLatestVideoMessage();
+      message = requestedMessageId !== undefined
+        ? await getVideoMessage(requestedMessageId)
+        : await findLatestVideoMessage();
     }
 
     const document = message.media.document;
