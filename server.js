@@ -448,7 +448,11 @@ async function getBotClient() {
     API_ID,
     API_HASH,
     {
-      connectionRetries: 5
+      connectionRetries: 5,
+      requestRetries: 5,
+      reconnectRetries: 3,
+      useIPV6: false,
+      useWSS: false
     }
   );
 
@@ -474,12 +478,35 @@ async function getSyncClient() {
     );
   }
 
+  // Render can occasionally surface a corrupted/stale Telegram DC hostname
+  // from the saved StringSession. Force a known production IPv4 endpoint for
+  // the session's own DC before connecting. This does not change the account
+  // authorization key; it only refreshes the socket endpoint.
+  const userDcId = Number(userStringSession.dcId || 4);
+  const USER_DC_ENDPOINTS = {
+    1: { host: "149.154.175.50", port: 443 },
+    2: { host: "149.154.167.51", port: 443 },
+    3: { host: "149.154.175.100", port: 443 },
+    4: { host: "149.154.167.91", port: 443 },
+    5: { host: "149.154.171.5", port: 443 }
+  };
+  const userEndpoint = USER_DC_ENDPOINTS[userDcId] || USER_DC_ENDPOINTS[4];
+  userStringSession.setDC(userDcId in USER_DC_ENDPOINTS ? userDcId : 4, userEndpoint.host, userEndpoint.port);
+
+  console.log(
+    `Telegram user session endpoint forced to DC${userDcId in USER_DC_ENDPOINTS ? userDcId : 4} ${userEndpoint.host}:${userEndpoint.port} (IPv4/TCP).`
+  );
+
   userTgClient = new TelegramClient(
     userStringSession,
     API_ID,
     API_HASH,
     {
-      connectionRetries: 5
+      connectionRetries: 5,
+      requestRetries: 5,
+      reconnectRetries: 3,
+      useIPV6: false,
+      useWSS: false
     }
   );
 
