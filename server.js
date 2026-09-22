@@ -75,7 +75,8 @@ const userStringSession = new StringSession(TELEGRAM_USER_SESSION_STRING);
 
 let botTgClient = null;
 let userTgClient = null;
-let cachedChannel = null;
+let cachedBotChannel = null;
+let cachedUserChannel = null;
 let firebaseReady = false;
 let courseCache = {
   data: null,
@@ -529,38 +530,33 @@ async function getSyncClient() {
 // ==================================================
 
 async function getChannel(client = null) {
-  if (cachedChannel) {
-    return cachedChannel;
-  }
-
   const tg = client || await getBotClient();
+  const isUserClient = tg === userTgClient;
 
-  const mtprotoChannelId =
-    BigInt(-CHANNEL_ID) - 1000000000000n;
-
-  const result = await tg.invoke(
-    new Api.channels.GetChannels({
-      id: [
-        new Api.InputChannel({
-          channelId: mtprotoChannelId,
-          accessHash: 0n
-        })
-      ]
-    })
-  );
-
-  const channel = result.chats?.[0];
-
-  if (!channel) {
-    throw new Error(
-      "Telegram channel could not be resolved."
-    );
-  }
-
-  cachedChannel = channel;
+  if (isUserClient && cachedUserChannel) return cachedUserChannel;
+  if (!isUserClient && cachedBotChannel) return cachedBotChannel;
 
   console.log(
-    `Channel resolved: ${channel.title || channel.id}`
+    `Resolving Telegram channel with ${isUserClient ? "user sync" : "bot playback"} client...`
+  );
+
+  // Resolve the channel through GramJS instead of manually constructing an
+  // InputChannel with accessHash=0. That old approach can work for a cached
+  // bot entity but may stall/fail for a fresh user session during sync.
+  const channel = await tg.getEntity(CHANNEL_ID);
+
+  if (!channel) {
+    throw new Error("Telegram channel could not be resolved.");
+  }
+
+  if (isUserClient) {
+    cachedUserChannel = channel;
+  } else {
+    cachedBotChannel = channel;
+  }
+
+  console.log(
+    `Channel resolved for ${isUserClient ? "user sync" : "bot playback"}: ${channel.title || channel.id}`
   );
 
   return channel;
@@ -738,8 +734,11 @@ async function persistVideoIndexUpdates(records) {
 }
 
 async function collectTelegramMessages({ fullScan = false } = {}) {
+  console.log("Telegram message collection started.");
   const tg = await getSyncClient();
+  console.log("Telegram sync client ready; resolving channel...");
   const channel = await getChannel(tg);
+  console.log("Telegram sync channel ready; beginning history scan...");
   const messages = new Map();
 
   const addMessage = (message) => {
@@ -1506,10 +1505,20 @@ app.get("/sync-status", async (req, res) => {
 app.get("/sync", async (req, res) => {
   try {
     const fullScan = parseBoolean(req.query.full, false);
-    await getCachedVideoLibrary(true, fullScan);
 
-    res.json({
+    // Start the scan in the background. Do not keep the browser request open
+    // while Telegram history is being paginated. The admin UI can poll
+    // /sync-status for progress and completion.
+    if (syncState.status !== "syncing") {
+      void syncTelegramVideoIndex({ fullScan }).catch((error) => {
+        console.error("BACKGROUND SYNC ERROR:", error);
+      });
+    }
+
+    res.status(202).json({
       success: true,
+      started: true,
+      message: "Telegram sync started in background.",
       sync: syncState,
       indexedVideoCount: videoIndex.size
     });
