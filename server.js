@@ -1613,4 +1613,4 @@ server.requestTimeout = 0;
 // Warm the Telegram video index in the background. On a warm Render instance,
 // the website can then receive /courses from memory instead of waiting for
 // Telegram discovery.
-void refreshVideoLibrary().catch(() => {});
+void getCachedVideoLibrary(false, false).catch(() => {});
