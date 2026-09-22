@@ -32,6 +32,9 @@ const PLAYBACK_TOKEN_TTL_SECONDS = Math.min(
 const API_ID = Number(process.env.TELEGRAM_API_ID);
 const API_HASH = process.env.TELEGRAM_API_HASH;
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_USER_SESSION_STRING = String(
+  process.env.TELEGRAM_USER_SESSION_STRING || ""
+).trim();
 
 const CHANNEL_ID = "-1004305906553";
 
@@ -67,9 +70,11 @@ const STREAM_CHUNK_SIZE = 1024 * 1024;
 const STREAM_CACHE_SECONDS = 60;
 const STREAM_PARALLEL_REQUESTS = 2;
 
-const stringSession = new StringSession("");
+const botStringSession = new StringSession("");
+const userStringSession = new StringSession(TELEGRAM_USER_SESSION_STRING);
 
-let tgClient = null;
+let botTgClient = null;
+let userTgClient = null;
 let cachedChannel = null;
 let firebaseReady = false;
 let courseCache = {
@@ -431,15 +436,15 @@ function hasCompleteMetadata(video) {
 // TELEGRAM CLIENT
 // ==================================================
 
-async function getClient() {
-  if (tgClient && tgClient.connected) {
-    return tgClient;
+async function getBotClient() {
+  if (botTgClient && botTgClient.connected) {
+    return botTgClient;
   }
 
   requireTelegramConfig();
 
-  tgClient = new TelegramClient(
-    stringSession,
+  botTgClient = new TelegramClient(
+    botStringSession,
     API_ID,
     API_HASH,
     {
@@ -447,25 +452,61 @@ async function getClient() {
     }
   );
 
-  await tgClient.start({
+  await botTgClient.start({
     botAuthToken: BOT_TOKEN
   });
 
-  console.log("Telegram MTProto connected.");
+  console.log("Telegram bot MTProto connected.");
 
-  return tgClient;
+  return botTgClient;
+}
+
+async function getSyncClient() {
+  if (userTgClient && userTgClient.connected) {
+    return userTgClient;
+  }
+
+  requireTelegramConfig();
+
+  if (!TELEGRAM_USER_SESSION_STRING) {
+    throw new Error(
+      "TELEGRAM_USER_SESSION_STRING is not configured. Create a Telegram user session and add it to Render before running Telegram library sync."
+    );
+  }
+
+  userTgClient = new TelegramClient(
+    userStringSession,
+    API_ID,
+    API_HASH,
+    {
+      connectionRetries: 5
+    }
+  );
+
+  await userTgClient.connect();
+
+  if (!(await userTgClient.checkAuthorization())) {
+    userTgClient = null;
+    throw new Error(
+      "Telegram user session is not authorized. Generate a new TELEGRAM_USER_SESSION_STRING."
+    );
+  }
+
+  console.log("Telegram user MTProto sync session connected.");
+
+  return userTgClient;
 }
 
 // ==================================================
 // GET CHANNEL
 // ==================================================
 
-async function getChannel() {
+async function getChannel(client = null) {
   if (cachedChannel) {
     return cachedChannel;
   }
 
-  const tg = await getClient();
+  const tg = client || await getBotClient();
 
   const mtprotoChannelId =
     BigInt(-CHANNEL_ID) - 1000000000000n;
@@ -503,8 +544,8 @@ async function getChannel() {
 // ==================================================
 
 async function getVideoMessage(messageId) {
-  const tg = await getClient();
-  const channel = await getChannel();
+  const tg = await getBotClient();
+  const channel = await getChannel(tg);
 
   const numericMessageId = Number(messageId);
 
@@ -670,8 +711,8 @@ async function persistVideoIndexUpdates(records) {
 }
 
 async function collectTelegramMessages({ fullScan = false } = {}) {
-  const tg = await getClient();
-  const channel = await getChannel();
+  const tg = await getSyncClient();
+  const channel = await getChannel(tg);
   const messages = new Map();
 
   const addMessage = (message) => {
@@ -993,7 +1034,7 @@ function buildCourseCatalogue(videos) {
 }
 
 async function streamTelegramVideo(req, res, message) {
-  const tg = await getClient();
+  const tg = await getBotClient();
   const document = message.media.document;
   const fileSize = Number(document.size);
 
@@ -1226,12 +1267,14 @@ function requireProductionSecurity() {
 
 app.get("/health", async (req, res) => {
   try {
-    await getClient();
+    await getBotClient();
 
     res.json({
       success: true,
       server: "Sayeed Courses Video API",
       telegram: "connected",
+      telegramBotConfigured: Boolean(API_ID && API_HASH && BOT_TOKEN),
+      telegramUserSyncConfigured: Boolean(API_ID && API_HASH && TELEGRAM_USER_SESSION_STRING),
       firebaseAdminConfigured: Boolean(
         process.env.FIREBASE_SERVICE_ACCOUNT_JSON
       ),
@@ -1613,4 +1656,10 @@ server.requestTimeout = 0;
 // Warm the Telegram video index in the background. On a warm Render instance,
 // the website can then receive /courses from memory instead of waiting for
 // Telegram discovery.
-void getCachedVideoLibrary(false, false).catch(() => {});
+if (TELEGRAM_USER_SESSION_STRING) {
+  void getCachedVideoLibrary(false, false).catch((error) => {
+    console.warn("Telegram user sync warm-up failed:", error?.message || error);
+  });
+} else {
+  console.warn("Telegram user sync session not configured; video library sync is waiting for TELEGRAM_USER_SESSION_STRING.");
+}
