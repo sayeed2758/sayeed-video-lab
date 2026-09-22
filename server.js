@@ -58,6 +58,23 @@ const VIDEO_INDEX_COLLECTION = String(
   process.env.VIDEO_INDEX_COLLECTION || "telegramVideoIndex"
 ).trim();
 
+// Direct admin -> Telegram upload engine. No video bytes are stored on Render.
+// Browser chunks are forwarded directly to Telegram's MTProto upload API.
+const TELEGRAM_UPLOAD_PART_SIZE = 512 * 1024; // Telegram-recommended max part size.
+const TELEGRAM_UPLOAD_MAX_BYTES = Math.min(
+  Math.max(
+    Number(process.env.TELEGRAM_UPLOAD_MAX_BYTES || 2 * 1024 * 1024 * 1024),
+    TELEGRAM_UPLOAD_PART_SIZE
+  ),
+  2 * 1024 * 1024 * 1024
+);
+const TELEGRAM_UPLOAD_COLLECTION = String(
+  process.env.TELEGRAM_UPLOAD_COLLECTION || "telegramUploadSessions"
+).trim();
+const TELEGRAM_UPLOAD_CHECKPOINT_EVERY = 20;
+const TELEGRAM_UPLOAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const TELEGRAM_UPLOAD_TOKEN_TTL_SECONDS = 24 * 60 * 60;
+
 // Video library metadata is relatively stable. Keep it warm for 5 minutes
 // and refresh it in the background after that instead of making students wait
 // for a Telegram scan on every page open.
@@ -72,11 +89,18 @@ const STREAM_PARALLEL_REQUESTS = 2;
 
 const botStringSession = new StringSession("");
 const userStringSession = new StringSession(TELEGRAM_USER_SESSION_STRING);
+const uploadBotStringSession = new StringSession("");
 
 let botTgClient = null;
+let uploadBotTgClient = null;
 let userTgClient = null;
 let cachedBotChannel = null;
+let cachedUploadBotChannel = null;
 let cachedUserChannel = null;
+
+// Active upload state is memory-fast. Firestore checkpoints contain only
+// metadata + a compact received-parts bitmap, never the video bytes.
+const activeTelegramUploads = new Map();
 let firebaseReady = false;
 let courseCache = {
   data: null,
@@ -132,8 +156,8 @@ app.use((req, res, next) => {
     res.setHeader("Vary", "Origin");
   }
 
-  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Range, Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Range, Content-Type, X-Upload-Id, X-Upload-Token");
   res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -151,6 +175,11 @@ app.use((req, res, next) => {
 });
 
 app.disable("x-powered-by");
+
+// Small JSON payloads are used for upload initialization/finalization.
+// Chunk bodies use application/octet-stream and are handled with route-local
+// raw parsing so the server never buffers an entire video.
+app.use(express.json({ limit: "256kb" }));
 
 // ==================================================
 // HELPERS
@@ -227,6 +256,55 @@ function verifyPlaybackToken(token) {
     throw httpError("Playback token has expired. Start playback again.", 401);
   }
   return payload;
+}
+
+function createUploadSessionToken({ uploadId, uid }) {
+  requirePlaybackSigningSecret();
+  const payload = {
+    typ: "sayeed-upload-session",
+    uploadId: String(uploadId),
+    uid: String(uid),
+    exp: Math.floor(Date.now() / 1000) + TELEGRAM_UPLOAD_TOKEN_TTL_SECONDS
+  };
+  const encoded = base64UrlEncode(JSON.stringify(payload));
+  return `${encoded}.${signPlaybackPayload(encoded)}`;
+}
+
+function verifyUploadSessionToken(token) {
+  requirePlaybackSigningSecret();
+  const raw = String(token || "").trim();
+  const [encoded, signature] = raw.split(".");
+  if (!encoded || !signature) throw httpError("Invalid upload token.", 401);
+
+  const expected = signPlaybackPayload(encoded);
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (actualBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(actualBuffer, expectedBuffer)) {
+    throw httpError("Invalid upload token.", 401);
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(base64UrlDecode(encoded));
+  } catch {
+    throw httpError("Invalid upload token.", 401);
+  }
+
+  if (
+    payload?.typ !== "sayeed-upload-session" ||
+    !payload?.uploadId ||
+    !payload?.uid ||
+    Number(payload.exp) <= Math.floor(Date.now() / 1000)
+  ) {
+    throw httpError("Upload token has expired or is invalid.", 401);
+  }
+  return payload;
+}
+
+async function requireUploadSession(req) {
+  const token = String(req.headers["x-upload-token"] || "").trim();
+  if (!token) throw httpError("Upload token is required.", 401);
+  return verifyUploadSessionToken(token);
 }
 
 function parseBoolean(value, fallback = false) {
@@ -346,7 +424,381 @@ async function requireCourseEnrollment(req, courseId) {
   return decoded;
 }
 
-function parseVideoMetadata(message) {
+async function requireAdmin(req) {
+  const decoded = await verifyFirebaseUser(req);
+  const snapshot = await getFirestore()
+    .collection("admins")
+    .doc(String(decoded.uid))
+    .get();
+
+  if (!snapshot.exists || String(snapshot.data()?.role || "").toLowerCase() !== "admin") {
+    throw httpError("Admin access required.", 403);
+  }
+
+  return decoded;
+}
+
+function normalizeFileName(name) {
+  const cleaned = String(name || "video.mp4")
+    .replace(/[\\/:*?"<>|\u0000-\u001F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (cleaned || "video.mp4").slice(0, 180);
+}
+
+function slugifyVideoId(value) {
+  const base = String(value || "video")
+    .replace(/\.[^.]+$/, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return base || "video";
+}
+
+function randomInt64String() {
+  const raw = BigInt(`0x${crypto.randomBytes(8).toString("hex")}`);
+  const positive = raw & ((1n << 63n) - 1n);
+  return String(positive || 1n);
+}
+
+function expectedUploadPartSize(session, partIndex) {
+  if (partIndex === session.totalParts - 1) {
+    return session.fileSize - (partIndex * session.partSize);
+  }
+  return session.partSize;
+}
+
+function createPartBitmap(totalParts, receivedParts) {
+  const bytes = Buffer.alloc(Math.ceil(totalParts / 8));
+  for (const index of receivedParts) {
+    if (index >= 0 && index < totalParts) {
+      bytes[Math.floor(index / 8)] |= 1 << (index % 8);
+    }
+  }
+  return bytes.toString("base64");
+}
+
+function readPartBitmap(totalParts, bitmap) {
+  const bytes = Buffer.from(String(bitmap || ""), "base64");
+  const received = new Set();
+  for (let index = 0; index < totalParts; index += 1) {
+    const byte = bytes[Math.floor(index / 8)] || 0;
+    if (byte & (1 << (index % 8))) received.add(index);
+  }
+  return received;
+}
+
+function calculateUploadedBytes(session) {
+  let total = 0;
+  for (const partIndex of session.receivedParts) {
+    total += expectedUploadPartSize(session, partIndex);
+  }
+  return total;
+}
+
+function getUploadSummary(session) {
+  const uploadedBytes = Number(session.uploadedBytes || calculateUploadedBytes(session));
+  const percent = session.fileSize > 0
+    ? Math.min(100, Math.max(0, (uploadedBytes / session.fileSize) * 100))
+    : 0;
+
+  return {
+    uploadId: session.uploadId,
+    status: session.status,
+    fileName: session.fileName,
+    fileSize: session.fileSize,
+    mimeType: session.mimeType,
+    partSize: session.partSize,
+    totalParts: session.totalParts,
+    completedParts: session.receivedParts.size,
+    uploadedBytes,
+    percent,
+    courseId: session.courseId,
+    courseName: session.courseName,
+    module: session.module,
+    videoId: session.videoId,
+    title: session.title,
+    durationSeconds: session.durationSeconds,
+    width: session.width,
+    height: session.height,
+    telegramMessageId: session.telegramMessageId || null,
+    error: session.error || null,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+    finalizedAt: session.finalizedAt || null
+  };
+}
+
+async function persistTelegramUploadSession(session, includeBitmap = true) {
+  getFirebaseAdmin();
+  const payload = {
+    uploadId: session.uploadId,
+    ownerUid: session.ownerUid,
+    fileId: String(session.fileId),
+    fileName: session.fileName,
+    fileSize: session.fileSize,
+    mimeType: session.mimeType,
+    partSize: session.partSize,
+    totalParts: session.totalParts,
+    courseId: session.courseId,
+    courseName: session.courseName,
+    module: session.module,
+    videoId: session.videoId,
+    title: session.title,
+    order: session.order,
+    durationSeconds: session.durationSeconds,
+    width: session.width,
+    height: session.height,
+    randomId: String(session.randomId),
+    status: session.status,
+    uploadedBytes: session.uploadedBytes,
+    completedParts: session.receivedParts.size,
+    telegramMessageId: session.telegramMessageId || null,
+    error: session.error || null,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+    finalizedAt: session.finalizedAt || null
+  };
+  if (includeBitmap) payload.receivedBitmap = createPartBitmap(session.totalParts, session.receivedParts);
+
+  await getFirestore()
+    .collection(TELEGRAM_UPLOAD_COLLECTION)
+    .doc(session.uploadId)
+    .set(payload, { merge: true });
+}
+
+async function loadTelegramUploadSession(uploadId, ownerUid) {
+  const cached = activeTelegramUploads.get(uploadId);
+  if (cached) {
+    if (String(cached.ownerUid) !== String(ownerUid)) throw httpError("Upload access denied.", 403);
+    return cached;
+  }
+
+  getFirebaseAdmin();
+  const snapshot = await getFirestore()
+    .collection(TELEGRAM_UPLOAD_COLLECTION)
+    .doc(String(uploadId))
+    .get();
+
+  if (!snapshot.exists) throw httpError("Upload session not found or expired.", 404);
+  const data = snapshot.data() || {};
+  if (String(data.ownerUid) !== String(ownerUid)) throw httpError("Upload access denied.", 403);
+
+  const session = {
+    uploadId: String(uploadId),
+    ownerUid: String(data.ownerUid),
+    fileId: String(data.fileId),
+    fileName: String(data.fileName || "video.mp4"),
+    fileSize: Number(data.fileSize || 0),
+    mimeType: String(data.mimeType || "video/mp4"),
+    partSize: Number(data.partSize || TELEGRAM_UPLOAD_PART_SIZE),
+    totalParts: Number(data.totalParts || 0),
+    courseId: String(data.courseId || ""),
+    courseName: String(data.courseName || ""),
+    module: String(data.module || "01"),
+    videoId: String(data.videoId || ""),
+    title: String(data.title || "Untitled lesson"),
+    order: Number(data.order || 0),
+    durationSeconds: Number(data.durationSeconds || 0),
+    width: Number(data.width || 0),
+    height: Number(data.height || 0),
+    randomId: String(data.randomId || randomInt64String()),
+    status: String(data.status || "uploading"),
+    receivedParts: readPartBitmap(Number(data.totalParts || 0), data.receivedBitmap),
+    uploadedBytes: Number(data.uploadedBytes || 0),
+    telegramMessageId: data.telegramMessageId ? Number(data.telegramMessageId) : null,
+    error: data.error || null,
+    createdAt: data.createdAt || new Date().toISOString(),
+    updatedAt: data.updatedAt || new Date().toISOString(),
+    finalizedAt: data.finalizedAt || null,
+    inFlightParts: new Map(),
+    lastCheckpointAt: Date.now()
+  };
+
+  session.uploadedBytes = calculateUploadedBytes(session);
+  activeTelegramUploads.set(session.uploadId, session);
+  return session;
+}
+
+function pruneExpiredUploadSessions() {
+  const cutoff = Date.now() - TELEGRAM_UPLOAD_SESSION_TTL_MS;
+  for (const [uploadId, session] of activeTelegramUploads) {
+    if (new Date(session.updatedAt).getTime() < cutoff && session.status !== "uploading" && session.status !== "finalizing") {
+      activeTelegramUploads.delete(uploadId);
+    }
+  }
+}
+
+async function getUploadBotClient() {
+  if (uploadBotTgClient && uploadBotTgClient.connected) return uploadBotTgClient;
+
+  requireTelegramConfig();
+  uploadBotTgClient = new TelegramClient(
+    uploadBotStringSession,
+    API_ID,
+    API_HASH,
+    {
+      connectionRetries: 5,
+      requestRetries: 5,
+      reconnectRetries: 3,
+      useIPV6: false,
+      useWSS: false
+    }
+  );
+
+  await uploadBotTgClient.start({ botAuthToken: BOT_TOKEN });
+  console.log("Telegram upload MTProto client connected.");
+  return uploadBotTgClient;
+}
+
+async function getUploadChannel() {
+  const tg = await getUploadBotClient();
+  if (cachedUploadBotChannel) return cachedUploadBotChannel;
+  const channel = await withTimeout(
+    tg.getEntity(CHANNEL_ID),
+    30000,
+    "Telegram upload channel resolution"
+  );
+  if (!channel) throw new Error("Telegram upload channel could not be resolved.");
+  cachedUploadBotChannel = channel;
+  console.log(`Telegram upload channel ready: ${channel.title || channel.id}`);
+  return channel;
+}
+
+function extractSentTelegramMessageId(result) {
+  if (Number(result?.id) > 0) return Number(result.id);
+  for (const update of result?.updates || []) {
+    const candidate = Number(update?.message?.id || update?.id || 0);
+    if (candidate > 0) return candidate;
+  }
+  return 0;
+}
+
+function buildUploadCaption(session) {
+  const lines = [
+    `COURSE: ${session.courseName}`,
+    `MODULE: ${session.module}`,
+    `VIDEO: ${session.videoId}`,
+    `TITLE: ${session.title}`
+  ];
+  return lines.join("\n").slice(0, 1024);
+}
+
+async function getCourseTitle(courseId, fallbackName = "") {
+  if (!courseId) throw httpError("courseId is required.", 400);
+  getFirebaseAdmin();
+  const snapshot = await getFirestore().collection("courses").doc(String(courseId)).get();
+  if (!snapshot.exists) throw httpError(`Course ${courseId} was not found.`, 404);
+  return String(snapshot.data()?.title || fallbackName || `Course ${courseId}`).trim();
+}
+
+async function registerUploadedVideo(session) {
+  if (!session.telegramMessageId) throw new Error("Telegram message ID is missing after upload.");
+
+  getFirebaseAdmin();
+  const firestore = getFirestore();
+  const now = new Date().toISOString();
+  const record = {
+    messageId: Number(session.telegramMessageId),
+    metadata: {
+      course: session.courseName,
+      module: session.module,
+      videoId: session.videoId,
+      title: session.title
+    },
+    file: {
+      size: session.fileSize,
+      sizeMB: session.fileSize / (1024 * 1024),
+      mimeType: session.mimeType,
+      fileName: session.fileName
+    },
+    durationSeconds: session.durationSeconds,
+    indexedAt: now,
+    lastSeenAt: now,
+    uploadSource: "admin-direct-mtproto"
+  };
+
+  await firestore
+    .collection(VIDEO_INDEX_COLLECTION)
+    .doc(String(session.telegramMessageId))
+    .set(record, { merge: true });
+
+  const lessonRef = firestore
+    .collection("videoLessons")
+    .doc(`${session.courseId}__${session.telegramMessageId}`);
+
+  let order = Number(session.order || 0);
+  if (order <= 0) {
+    const existing = await firestore
+      .collection("videoLessons")
+      .where("courseId", "==", String(session.courseId))
+      .get();
+    order = existing.docs.reduce(
+      (max, item) => Math.max(max, Number(item.data()?.order || 0)),
+      0
+    ) + 1;
+  }
+
+  const lesson = {
+    courseId: String(session.courseId),
+    sourceCourse: session.courseName,
+    module: session.module || "01",
+    messageId: Number(session.telegramMessageId),
+    videoId: session.videoId,
+    title: session.title,
+    order,
+    published: true,
+    duration: session.durationSeconds > 0 ? String(session.durationSeconds) : "",
+    updatedAt: now,
+    uploadSource: "admin-direct-mtproto"
+  };
+
+  await lessonRef.set(lesson, { merge: true });
+
+  videoIndex.set(Number(session.telegramMessageId), record);
+  videoIndexLoaded = true;
+  courseCache.data = null;
+  courseCache.expiresAt = 0;
+
+  return {
+    index: record,
+    lesson: { id: lessonRef.id, ...lesson }
+  };
+}
+
+function assertUploadPart(partIndex, totalParts) {
+  if (!Number.isInteger(partIndex) || partIndex < 0 || partIndex >= totalParts) {
+    throw httpError("Invalid upload part number.", 400);
+  }
+}
+
+function assertUploadMime(fileName, mimeType) {
+  const mime = String(mimeType || "").toLowerCase();
+  const name = String(fileName || "").toLowerCase();
+  const allowedExtension = /\.(mp4|m4v|mov|webm|mkv|avi|mpeg|mpg|3gp)$/i.test(name);
+  if (!mime.startsWith("video/") && !allowedExtension) {
+    throw httpError("Only video files are supported by the direct Telegram uploader.", 400);
+  }
+}
+
+function validateUploadSessionForChunk(session) {
+  if (["cancelled", "complete"].includes(session.status)) {
+    throw httpError(`Upload is already ${session.status}.`, 409);
+  }
+  if (Date.now() - new Date(session.createdAt).getTime() > TELEGRAM_UPLOAD_SESSION_TTL_MS) {
+    throw httpError("Upload session expired. Start a new upload.", 410);
+  }
+}
+
+function encodeUploadFileSummary(session) {
+  return {
+    fileId: String(session.fileId),
+    totalParts: session.totalParts,
+    partSize: session.partSize
+  };
+}
+
   const text = message?.message || "";
 
   const course =
@@ -1551,6 +2003,379 @@ app.get("/library", async (req, res) => {
 });
 
 // ==================================================
+// DIRECT TELEGRAM UPLOAD ENGINE
+//
+// Browser -> Render chunk -> Telegram MTProto.
+// Render never writes the video bytes to disk or any cloud storage.
+// ==================================================
+
+app.post("/upload/init", async (req, res) => {
+  try {
+    const adminUser = await requireAdmin(req);
+    pruneExpiredUploadSessions();
+
+    const body = req.body || {};
+    const fileName = normalizeFileName(body.fileName);
+    const fileSize = Number(body.fileSize || 0);
+    const mimeType = String(body.mimeType || "video/mp4").trim().toLowerCase();
+    const courseId = String(body.courseId || "").trim();
+    const module = String(body.module || "01").trim() || "01";
+    const title = String(body.title || fileName.replace(/\.[^.]+$/, "") || "Untitled lesson").trim().slice(0, 180);
+    const requestedVideoId = String(body.videoId || "").trim().slice(0, 80);
+    const courseName = await getCourseTitle(courseId, body.courseName);
+    const videoId = requestedVideoId || `${slugifyVideoId(title)}-${Date.now().toString(36)}`;
+    const order = Number(body.order || 0);
+    const durationSeconds = Math.max(0, Number(body.durationSeconds || 0));
+    const width = Math.max(0, Math.floor(Number(body.width || 0)));
+    const height = Math.max(0, Math.floor(Number(body.height || 0)));
+
+    if (!Number.isSafeInteger(fileSize) || fileSize <= 0) {
+      throw httpError("A valid video file size is required.", 400);
+    }
+    if (fileSize > TELEGRAM_UPLOAD_MAX_BYTES) {
+      throw httpError(
+        `This uploader accepts files up to ${(TELEGRAM_UPLOAD_MAX_BYTES / (1024 * 1024 * 1024)).toFixed(0)} GB in this build.`,
+        413
+      );
+    }
+    assertUploadMime(fileName, mimeType);
+
+    const totalParts = Math.ceil(fileSize / TELEGRAM_UPLOAD_PART_SIZE);
+    if (totalParts > 4000) {
+      throw httpError("This file would require more Telegram parts than this uploader currently allows.", 413);
+    }
+
+    const uploadId = crypto.randomBytes(18).toString("base64url");
+    const session = {
+      uploadId,
+      ownerUid: String(adminUser.uid),
+      fileId: randomInt64String(),
+      fileName,
+      fileSize,
+      mimeType: mimeType.startsWith("video/") ? mimeType : "video/mp4",
+      partSize: TELEGRAM_UPLOAD_PART_SIZE,
+      totalParts,
+      courseId,
+      courseName,
+      module,
+      videoId,
+      title,
+      order: Number.isFinite(order) && order > 0 ? Math.floor(order) : 0,
+      durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : 0,
+      width,
+      height,
+      randomId: randomInt64String(),
+      status: "uploading",
+      receivedParts: new Set(),
+      uploadedBytes: 0,
+      telegramMessageId: null,
+      error: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      finalizedAt: null,
+      inFlightParts: new Map(),
+      lastCheckpointAt: Date.now()
+    };
+
+    activeTelegramUploads.set(uploadId, session);
+    await persistTelegramUploadSession(session, true);
+
+    console.log(
+      `DIRECT TELEGRAM UPLOAD INIT: ${uploadId} · ${fileName} · ${(fileSize / (1024 * 1024)).toFixed(1)} MB · ${totalParts} parts · course ${courseId}`
+    );
+
+    res.status(201).json({
+      success: true,
+      upload: getUploadSummary(session),
+      uploadFile: encodeUploadFileSummary(session),
+      uploadToken: createUploadSessionToken({ uploadId: session.uploadId, uid: session.ownerUid }),
+      message: "Upload session created. Send Telegram-sized chunks to /upload/chunk."
+    });
+  } catch (error) {
+    console.error("UPLOAD INIT ERROR:", error);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.message || "Could not initialize Telegram upload."
+    });
+  }
+});
+
+app.post(
+  "/upload/chunk",
+  express.raw({
+    type: "application/octet-stream",
+    limit: "600kb"
+  }),
+  async (req, res) => {
+    try {
+      const uploadAuth = await requireUploadSession(req);
+      const uploadId = String(req.query.uploadId || req.headers["x-upload-id"] || uploadAuth.uploadId || "").trim();
+      const partIndex = Number(req.query.part || req.headers["x-upload-part"]);
+      if (!uploadId) throw httpError("uploadId is required.", 400);
+      if (String(uploadAuth.uploadId) !== uploadId) throw httpError("Upload token does not match this session.", 403);
+
+      const session = await loadTelegramUploadSession(uploadId, uploadAuth.uid);
+      validateUploadSessionForChunk(session);
+      assertUploadPart(partIndex, session.totalParts);
+
+      const expectedBytes = expectedUploadPartSize(session, partIndex);
+      const body = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || []);
+      if (body.length !== expectedBytes) {
+        throw httpError(
+          `Upload part ${partIndex} has ${body.length} bytes; expected ${expectedBytes}.`,
+          400
+        );
+      }
+
+      if (session.receivedParts.has(partIndex)) {
+        return res.json({
+          success: true,
+          alreadyReceived: true,
+          upload: getUploadSummary(session)
+        });
+      }
+
+      if (session.inFlightParts.has(partIndex)) {
+        await session.inFlightParts.get(partIndex);
+        return res.json({
+          success: true,
+          alreadyReceived: session.receivedParts.has(partIndex),
+          upload: getUploadSummary(session)
+        });
+      }
+
+      const promise = (async () => {
+        const tg = await getUploadBotClient();
+        const response = await tg.invoke(
+          new Api.upload.SaveBigFilePart({
+            fileId: bigInt(session.fileId),
+            filePart: partIndex,
+            fileTotalParts: session.totalParts,
+            bytes: body
+          })
+        );
+
+        if (!response) {
+          throw new Error(`Telegram rejected upload part ${partIndex}.`);
+        }
+
+        session.receivedParts.add(partIndex);
+        session.uploadedBytes += expectedBytes;
+        session.updatedAt = new Date().toISOString();
+        session.status = "uploading";
+        session.error = null;
+
+        if (
+          session.receivedParts.size % TELEGRAM_UPLOAD_CHECKPOINT_EVERY === 0 ||
+          session.receivedParts.size === session.totalParts
+        ) {
+          await persistTelegramUploadSession(session, true);
+          session.lastCheckpointAt = Date.now();
+        }
+      })();
+
+      session.inFlightParts.set(partIndex, promise);
+      try {
+        await promise;
+      } finally {
+        session.inFlightParts.delete(partIndex);
+      }
+
+      console.log(
+        `DIRECT TELEGRAM UPLOAD PART: ${uploadId} · ${partIndex + 1}/${session.totalParts}`
+      );
+
+      res.json({
+        success: true,
+        part: partIndex,
+        upload: getUploadSummary(session)
+      });
+    } catch (error) {
+      console.error("UPLOAD CHUNK ERROR:", error);
+      res.status(error.statusCode || 500).json({
+        success: false,
+        error: error.message || "Could not upload this Telegram chunk."
+      });
+    }
+  }
+);
+
+app.get("/upload/status", async (req, res) => {
+  try {
+    const uploadAuth = await requireUploadSession(req);
+    const uploadId = String(req.query.uploadId || "").trim();
+    if (!uploadId) throw httpError("uploadId is required.", 400);
+    if (String(uploadAuth.uploadId) !== uploadId) throw httpError("Upload token does not match this session.", 403);
+    const session = await loadTelegramUploadSession(uploadId, uploadAuth.uid);
+    res.json({
+      success: true,
+      upload: getUploadSummary(session)
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.message || "Could not load upload status."
+    });
+  }
+});
+
+app.post("/upload/finalize", async (req, res) => {
+  try {
+    const uploadAuth = await requireUploadSession(req);
+    const uploadId = String(req.query.uploadId || req.body?.uploadId || uploadAuth.uploadId || "").trim();
+    if (!uploadId) throw httpError("uploadId is required.", 400);
+    if (String(uploadAuth.uploadId) !== uploadId) throw httpError("Upload token does not match this session.", 403);
+
+    const session = await loadTelegramUploadSession(uploadId, uploadAuth.uid);
+
+    if (session.status === "complete") {
+      return res.json({ success: true, upload: getUploadSummary(session) });
+    }
+
+    if (session.inFlightParts.size > 0) {
+      await Promise.allSettled(Array.from(session.inFlightParts.values()));
+    }
+
+    if (session.receivedParts.size !== session.totalParts) {
+      const missing = [];
+      for (let index = 0; index < session.totalParts && missing.length < 30; index += 1) {
+        if (!session.receivedParts.has(index)) missing.push(index);
+      }
+      throw httpError(
+        `Upload is not complete. ${session.totalParts - session.receivedParts.size} parts are still missing.`,
+        409
+      );
+    }
+
+    if (!session.telegramMessageId) {
+      session.status = "finalizing";
+      session.error = null;
+      session.updatedAt = new Date().toISOString();
+      await persistTelegramUploadSession(session, true);
+
+      const tg = await getUploadBotClient();
+      const channel = await getUploadChannel();
+      const inputFile = new Api.InputFileBig({
+        id: bigInt(session.fileId),
+        parts: session.totalParts,
+        name: session.fileName
+      });
+
+      const attributes = [
+        new Api.DocumentAttributeFilename({ fileName: session.fileName }),
+        new Api.DocumentAttributeVideo({
+          duration: Number(session.durationSeconds || 0),
+          w: Number(session.width || 0),
+          h: Number(session.height || 0),
+          supportsStreaming: true
+        })
+      ];
+
+      console.log(
+        `DIRECT TELEGRAM FINALIZE: ${uploadId} · sending ${session.fileName} to ${channel.title || channel.id}`
+      );
+
+      const result = await tg.invoke(
+        new Api.messages.SendMedia({
+          peer: channel,
+          media: new Api.InputMediaUploadedDocument({
+            file: inputFile,
+            mimeType: session.mimeType || "video/mp4",
+            attributes
+          }),
+          message: buildUploadCaption(session),
+          randomId: bigInt(session.randomId)
+        })
+      );
+
+      const messageId = extractSentTelegramMessageId(result);
+      if (!messageId) {
+        throw new Error("Telegram accepted the file but no message ID was returned. Check the channel manually before retrying finalize.");
+      }
+
+      session.telegramMessageId = messageId;
+      session.updatedAt = new Date().toISOString();
+      await persistTelegramUploadSession(session, true);
+    }
+
+    try {
+      const registration = await registerUploadedVideo(session);
+      session.status = "complete";
+      session.finalizedAt = new Date().toISOString();
+      session.updatedAt = session.finalizedAt;
+      session.error = null;
+      await persistTelegramUploadSession(session, true);
+
+      console.log(
+        `DIRECT TELEGRAM UPLOAD COMPLETE: ${uploadId} · message ${session.telegramMessageId} · course ${session.courseId}`
+      );
+
+      return res.json({
+        success: true,
+        upload: getUploadSummary(session),
+        telegramMessageId: session.telegramMessageId,
+        registration
+      });
+    } catch (registrationError) {
+      session.status = "uploaded_unregistered";
+      session.error = registrationError?.message || "Telegram upload succeeded but course registration failed.";
+      session.updatedAt = new Date().toISOString();
+      await persistTelegramUploadSession(session, true);
+      throw httpError(
+        `Telegram upload succeeded as message ${session.telegramMessageId}, but course registration needs a retry: ${session.error}`,
+        500
+      );
+    }
+  } catch (error) {
+    console.error("UPLOAD FINALIZE ERROR:", error);
+    try {
+      const uploadAuth = await requireUploadSession(req);
+      const uploadId = String(req.query.uploadId || req.body?.uploadId || uploadAuth.uploadId || "").trim();
+      if (uploadId && String(uploadAuth.uploadId) === uploadId) {
+        const session = await loadTelegramUploadSession(uploadId, uploadAuth.uid);
+        if (session.status !== "complete") {
+          session.status = session.telegramMessageId ? "uploaded_unregistered" : "failed";
+          session.error = error.message || "Finalize failed.";
+          session.updatedAt = new Date().toISOString();
+          await persistTelegramUploadSession(session, true).catch(() => {});
+        }
+      }
+    } catch {}
+
+    res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.message || "Could not finalize Telegram upload."
+    });
+  }
+});
+
+app.post("/upload/cancel", async (req, res) => {
+  try {
+    const uploadAuth = await requireUploadSession(req);
+    const uploadId = String(req.query.uploadId || req.body?.uploadId || uploadAuth.uploadId || "").trim();
+    if (!uploadId) throw httpError("uploadId is required.", 400);
+    if (String(uploadAuth.uploadId) !== uploadId) throw httpError("Upload token does not match this session.", 403);
+    const session = await loadTelegramUploadSession(uploadId, uploadAuth.uid);
+
+    if (session.status === "complete") {
+      throw httpError("Completed uploads cannot be cancelled from this endpoint.", 409);
+    }
+
+    session.status = "cancelled";
+    session.error = "Cancelled by admin.";
+    session.updatedAt = new Date().toISOString();
+    await persistTelegramUploadSession(session, true);
+
+    res.json({ success: true, upload: getUploadSummary(session) });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.message || "Could not cancel Telegram upload."
+    });
+  }
+});
+
+// ==================================================
 // TELEGRAM SYNC STATUS / MANUAL SYNC
 // ==================================================
 
@@ -1752,6 +2577,9 @@ const server = app.listen(PORT, () => {
   );
   console.log(
     `Streaming: ${STREAM_CHUNK_SIZE / (1024 * 1024)} MiB chunks, ${STREAM_PARALLEL_REQUESTS} parallel requests`
+  );
+  console.log(
+    `Direct Telegram uploader: ${(TELEGRAM_UPLOAD_PART_SIZE / 1024).toFixed(0)} KiB parts, max ${(TELEGRAM_UPLOAD_MAX_BYTES / (1024 * 1024 * 1024)).toFixed(0)} GiB`
   );
 });
 
