@@ -466,6 +466,20 @@ async function getBotClient() {
   return botTgClient;
 }
 
+async function withTimeout(promise, ms, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms.`)), ms);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function getSyncClient() {
   if (userTgClient && userTgClient.connected) {
     return userTgClient;
@@ -479,23 +493,12 @@ async function getSyncClient() {
     );
   }
 
-  // Render can occasionally surface a corrupted/stale Telegram DC hostname
-  // from the saved StringSession. Force a known production IPv4 endpoint for
-  // the session's own DC before connecting. This does not change the account
-  // authorization key; it only refreshes the socket endpoint.
-  const userDcId = Number(userStringSession.dcId || 4);
-  const USER_DC_ENDPOINTS = {
-    1: { host: "149.154.175.50", port: 443 },
-    2: { host: "149.154.167.51", port: 443 },
-    3: { host: "149.154.175.100", port: 443 },
-    4: { host: "149.154.167.91", port: 443 },
-    5: { host: "149.154.171.5", port: 443 }
-  };
-  const userEndpoint = USER_DC_ENDPOINTS[userDcId] || USER_DC_ENDPOINTS[4];
-  userStringSession.setDC(userDcId in USER_DC_ENDPOINTS ? userDcId : 4, userEndpoint.host, userEndpoint.port);
-
+  // Do NOT manually force a DC here. The StringSession contains the account's
+  // current DC/auth information, and GramJS must be allowed to handle DC
+  // migration itself. Manually calling setDC() can cause a valid session to
+  // bounce between DCs and leave history requests waiting indefinitely.
   console.log(
-    `Telegram user session endpoint forced to DC${userDcId in USER_DC_ENDPOINTS ? userDcId : 4} ${userEndpoint.host}:${userEndpoint.port} (IPv4/TCP).`
+    `Telegram sync session loaded (saved DC: ${userStringSession.dcId || "unknown"}). Connecting with GramJS-managed DC...`
   );
 
   userTgClient = new TelegramClient(
@@ -503,26 +506,54 @@ async function getSyncClient() {
     API_ID,
     API_HASH,
     {
-      connectionRetries: 5,
-      requestRetries: 5,
-      reconnectRetries: 3,
+      connectionRetries: 3,
+      requestRetries: 2,
+      reconnectRetries: 2,
       useIPV6: false,
       useWSS: false
     }
   );
 
-  await userTgClient.connect();
-
-  if (!(await userTgClient.checkAuthorization())) {
-    userTgClient = null;
-    throw new Error(
-      "Telegram user session is not authorized. Generate a new TELEGRAM_USER_SESSION_STRING."
+  try {
+    await withTimeout(
+      userTgClient.connect(),
+      30000,
+      "Telegram user session connection"
     );
+
+    console.log("Telegram user session TCP connection established.");
+
+    const authorized = await withTimeout(
+      userTgClient.checkAuthorization(),
+      15000,
+      "Telegram user authorization check"
+    );
+
+    if (!authorized) {
+      throw new Error(
+        "Telegram user session is not authorized. Generate a new TELEGRAM_USER_SESSION_STRING."
+      );
+    }
+
+    // Force one lightweight authenticated request before history scanning.
+    const me = await withTimeout(
+      userTgClient.getMe(),
+      15000,
+      "Telegram user identity check"
+    );
+
+    console.log(
+      `Telegram user MTProto sync session connected and authorized as ${me?.username || me?.firstName || "Telegram user"}.`
+    );
+
+    return userTgClient;
+  } catch (error) {
+    try {
+      await userTgClient.disconnect();
+    } catch {}
+    userTgClient = null;
+    throw error;
   }
-
-  console.log("Telegram user MTProto sync session connected.");
-
-  return userTgClient;
 }
 
 // ==================================================
@@ -543,7 +574,11 @@ async function getChannel(client = null) {
   // Resolve the channel through GramJS instead of manually constructing an
   // InputChannel with accessHash=0. That old approach can work for a cached
   // bot entity but may stall/fail for a fresh user session during sync.
-  const channel = await tg.getEntity(CHANNEL_ID);
+  const channel = await withTimeout(
+    tg.getEntity(CHANNEL_ID),
+    30000,
+    `Telegram channel resolution (${isUserClient ? "user sync" : "bot playback"})`
+  );
 
   if (!channel) {
     throw new Error("Telegram channel could not be resolved.");
@@ -738,13 +773,30 @@ async function collectTelegramMessages({ fullScan = false } = {}) {
   const tg = await getSyncClient();
   console.log("Telegram sync client ready; resolving channel...");
   const channel = await getChannel(tg);
-  console.log("Telegram sync channel ready; beginning history scan...");
+  console.log(
+    `Telegram sync channel ready: ${channel.title || channel.id}; beginning history scan...`
+  );
+
   const messages = new Map();
+  let scanned = 0;
+  let lastProgressAt = Date.now();
 
   const addMessage = (message) => {
     const id = Number(message?.id || 0);
     if (id > 0) messages.set(id, message);
   };
+
+  // Probe history before entering the long iterator. This gives a clear
+  // timeout/error instead of leaving /sync-status stuck at 0 forever.
+  console.log("Telegram history probe started...");
+  const probe = await withTimeout(
+    tg.getMessages(channel, { limit: 1 }),
+    30000,
+    "Telegram history probe"
+  );
+  console.log(
+    `Telegram history probe complete: ${probe?.length || 0} message(s).`
+  );
 
   if (fullScan || videoIndex.size === 0) {
     console.log(
@@ -755,15 +807,23 @@ async function collectTelegramMessages({ fullScan = false } = {}) {
       limit: TELEGRAM_SYNC_MAX_MESSAGES
     })) {
       addMessage(message);
+      scanned += 1;
+      syncState.scannedMessages = scanned;
+
+      if (Date.now() - lastProgressAt >= 5000) {
+        console.log(
+          `Telegram sync progress: ${scanned} messages scanned; ${messages.size} unique messages collected.`
+        );
+        lastProgressAt = Date.now();
+      }
     }
   } else {
-    // Always rescan a recent window. This catches edited captions and videos
-    // that were posted without complete metadata, while minId picks up the
-    // genuinely new tail of the channel history.
     for await (const message of tg.iterMessages(channel, {
       limit: TELEGRAM_RECENT_WINDOW
     })) {
       addMessage(message);
+      scanned += 1;
+      syncState.scannedMessages = scanned;
     }
 
     const highestMessageId = getMaxIndexedMessageId();
@@ -777,11 +837,17 @@ async function collectTelegramMessages({ fullScan = false } = {}) {
         reverse: true
       })) {
         addMessage(message);
+        scanned += 1;
+        syncState.scannedMessages = scanned;
         discoveredNewMessages += 1;
         if (discoveredNewMessages >= TELEGRAM_NEW_MESSAGE_LIMIT) break;
       }
     }
   }
+
+  console.log(
+    `Telegram history scan finished: ${scanned} messages scanned, ${messages.size} unique messages collected.`
+  );
 
   return Array.from(messages.values()).sort(
     (a, b) => Number(a.id) - Number(b.id)
@@ -835,7 +901,11 @@ async function syncTelegramVideoIndex({ fullScan = false } = {}) {
     try {
       await loadVideoIndexFromFirestore();
 
-      const messages = await collectTelegramMessages({ fullScan });
+      const messages = await withTimeout(
+        collectTelegramMessages({ fullScan }),
+        8 * 60 * 1000,
+        "Telegram video library sync"
+      );
       const discoveredVideos = messages
         .filter(isVideoMessage)
         .map((message) => normalizeVideoRecord(toVideoRecord(message)));
